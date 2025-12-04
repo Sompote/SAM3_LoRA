@@ -1,0 +1,82 @@
+# SAM3 LoRA Training Configuration
+# Base configuration with conservative settings
+
+# Model settings
+model:
+  name: "facebook/sam3"
+  cache_dir: null  # Optional: specify cache directory for model downloads
+
+# LoRA settings
+lora:
+  rank: 8                    # Rank of LoRA matrices (higher = more capacity, more parameters)
+  alpha: 16                  # Scaling factor (typically 2x rank)
+  dropout: 0.0               # Dropout for LoRA layers
+
+  # Target modules - which linear layers to apply LoRA to
+  target_modules:
+    - "q_proj"               # Query projection in attention
+    - "k_proj"               # Key projection in attention
+    - "v_proj"               # Value projection in attention
+    - "out_proj"             # Output projection in attention
+
+  # Component-level control - apply LoRA to specific SAM3 components
+  apply_to_vision_encoder: true      # 32-layer ViT backbone (1008x1008 images)
+  apply_to_text_encoder: true        # Text encoder for concept prompts
+  apply_to_geometry_encoder: false   # Geometry encoder (3 layers, for bbox prompts)
+  apply_to_detr_encoder: true        # DETR encoder (6 layers, vision-text fusion)
+  apply_to_detr_decoder: true        # DETR decoder (6 layers, 200 object queries)
+  apply_to_mask_decoder: false       # Mask decoder (3 upsampling stages)
+
+# Training settings
+training:
+  # Data
+  train_data_path: "data/train"
+  val_data_path: "data/val"
+  batch_size: 4
+  num_workers: 4
+
+  # Optimization
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1e-8
+  max_grad_norm: 1.0         # Gradient clipping
+
+  # Schedule
+  num_epochs: 10
+  warmup_steps: 500
+  lr_scheduler: "cosine"     # Options: cosine, linear, constant
+
+  # Logging
+  logging_steps: 10
+  eval_steps: 500
+  save_steps: 1000
+  save_total_limit: 3        # Keep only best 3 checkpoints
+
+  # Mixed precision
+  mixed_precision: "fp16"    # Options: no, fp16, bf16
+
+  # Other
+  seed: 42
+  gradient_accumulation_steps: 1
+
+# Output settings
+output:
+  output_dir: "outputs/sam3_lora"
+  logging_dir: "logs"
+  save_lora_only: true       # Save only LoRA weights (lightweight)
+  push_to_hub: false
+  hub_model_id: null
+
+# Evaluation settings
+evaluation:
+  metric: "iou"              # IoU (Intersection over Union) for segmentation
+  save_predictions: false
+  compute_metrics_during_training: true
+
+# Hardware settings
+hardware:
+  device: "cuda"             # cuda or cpu
+  dataloader_pin_memory: true
+  use_compile: false         # torch.compile (requires PyTorch 2.0+)
