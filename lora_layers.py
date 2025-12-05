@@ -167,6 +167,10 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
         Model with LoRA applied
     """
 
+    # CRITICAL: Freeze all base model parameters first
+    for param in model.parameters():
+        param.requires_grad = False
+
     def should_apply_lora(module_name: str) -> bool:
         """Determine if LoRA should be applied to this module."""
 
