@@ -30,6 +30,7 @@ class SeparatedMultiheadAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         
         self.dropout_p = dropout
+        self.batch_first = True  # Required for compatibility with TransformerEncoderLayer
 
     def forward(self, query, key, value, attn_mask=None, key_padding_mask=None, is_causal=False, **kwargs):
         # Inputs are (Batch, Seq, Dim) assuming batch_first=True usage

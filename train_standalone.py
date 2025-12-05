@@ -157,6 +157,7 @@ def main():
         device="cuda" if torch.cuda.is_available() else "cpu",
         max_epochs=config["training"]["epochs"],
         save_dir=config["checkpoint"]["save_dir"],
+        inject_lora=False,
     )
 
     # 6. Load checkpoint if resuming

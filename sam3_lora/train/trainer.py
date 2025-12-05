@@ -45,6 +45,7 @@ class SimpleLoRATrainer:
         device: str = "cuda",
         max_epochs: int = 10,
         save_dir: str = "./checkpoints",
+        inject_lora: bool = True,
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.max_epochs = max_epochs
@@ -52,8 +53,13 @@ class SimpleLoRATrainer:
         os.makedirs(save_dir, exist_ok=True)
 
         # Inject LoRA
-        print("Injecting LoRA into model...")
-        self.model = inject_lora_into_model(model, lora_config, verbose=True)
+        if inject_lora:
+            print("Injecting LoRA into model...")
+            self.model = inject_lora_into_model(model, lora_config, verbose=True)
+        else:
+            print("Skipping LoRA injection (assumed already injected)...")
+            self.model = model
+            
         self.model = self.model.to(self.device)
 
         print("\nModel statistics:")
