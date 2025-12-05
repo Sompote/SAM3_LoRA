@@ -17,11 +17,12 @@
 ## Overview
 
 **✨ Recent Highlights ✨**
-- **Truly Standalone**: Full SAM3 library code now bundled within the repository.
-- **YAML Config**: Training scripts now driven by comprehensive YAML configuration files.
-- **Enhanced LoRA Injection**: Standalone models now support full LoRA injection into Q, K, V projections.
-- **Efficient Checkpointing**: Only `best.pt` and `last.pt` saved to conserve disk space.
-- **Inference Ready**: Dedicated inference scripts for both standalone and real SAM3 models.
+- **CLI Configuration**: `train_sam3_lora_native.py` supports `--config` argument for flexible YAML config selection.
+- **Full SAM3 Integration**: Native training with complete SAM3 model and LoRA fine-tuning.
+- **YAML-Driven**: All training parameters configured via comprehensive YAML files.
+- **Flexible LoRA**: Apply LoRA to any combination of model components (vision, text, DETR, mask decoder).
+- **Production Ready**: Tested training pipeline with proper loss functions and optimizers.
+- **Easy to Use**: Simple CLI interface with sensible defaults.
 
 
 A standalone LoRA (Low-Rank Adaptation) implementation for efficient fine-tuning of deep learning models. Train with **less than 1% of parameters** while maintaining performance.
@@ -54,9 +55,6 @@ cd sam3_lora
 
 # Install package
 pip install -e .
-
-# Test installation
-python3 test_standalone.py
 ```
 
 **Requirements:**
@@ -74,51 +72,96 @@ tensorboard>=2.12.0
 
 ## Quick Start
 
-### Option 1: Standalone Training (Works Immediately!)
+### Training
 
-Test LoRA with a simple model on your data:
+Train with the full SAM3 model using LoRA fine-tuning:
 
 ```bash
-# Test LoRA injection
-python3 test_standalone.py
+# Use default config
+python3 train_sam3_lora_native.py
 
-# Run standalone training
-python3 train_standalone.py --config configs/sam3_lora_standalone.yaml
+# Specify custom config file
+python3 train_sam3_lora_native.py --config configs/full_lora_config.yaml
+
+# Use different config for experiments
+python3 train_sam3_lora_native.py --config configs/my_custom_config.yaml
 ```
 
-### Inference
+**Available YAML Configuration Parameters:**
 
-Run inference with your trained LoRA models.
+The config file (`configs/full_lora_config.yaml`) supports the following parameters:
 
-**Standalone Model Inference:**
+```yaml
+# LoRA Configuration
+lora:
+  rank: 16                          # LoRA rank (4, 8, 16, 32, 64)
+  alpha: 32                         # Alpha scaling (typically 2x rank)
+  dropout: 0.1                      # Dropout rate (0.0-0.3)
+  target_modules:                   # Module types to apply LoRA
+    - "q_proj"                      # Query projection
+    - "k_proj"                      # Key projection
+    - "v_proj"                      # Value projection
+    - "out_proj"                    # Output projection
+    - "fc1"                         # MLP first layer
+    - "fc2"                         # MLP second layer
+
+  # Model component flags
+  apply_to_vision_encoder: true     # Apply to vision encoder
+  apply_to_text_encoder: false      # Apply to text encoder
+  apply_to_geometry_encoder: false  # Apply to geometry encoder
+  apply_to_detr_encoder: false      # Apply to DETR encoder
+  apply_to_detr_decoder: false      # Apply to DETR decoder
+  apply_to_mask_decoder: true       # Apply to mask decoder
+
+# Training Configuration
+training:
+  batch_size: 1                     # Batch size per GPU
+  num_epochs: 20                    # Number of training epochs
+  learning_rate: 5e-5               # Learning rate
+  weight_decay: 0.01                # Weight decay for regularization
+
+# Output Configuration
+output:
+  output_dir: "outputs/sam3_lora_full"  # Where to save trained weights
+```
+
+**Example Configurations:**
+
+Create multiple config files for different experiments:
+
 ```bash
-# Example with the SimpleSegmentationModel
-python3 inference_standalone.py \
-  --config configs/sam3_lora_standalone.yaml \
-  --checkpoint ./checkpoints/best.pt \
-  --image ./data/test_image.jpg \
-  --device cuda
+# Quick test (low rank, few epochs)
+configs/
+  ├── quick_test_config.yaml      # rank=4, epochs=5
+  ├── vision_only_config.yaml     # Only vision encoder
+  ├── full_lora_config.yaml       # All components (default)
+  └── production_config.yaml      # High rank, many epochs
 ```
 
-**Real SAM3 Model Inference:**
+Then train with:
 ```bash
-# Example with the full SAM3 model (requires base_config.yaml or similar)
-python3 inference_real.py \
-  --config configs/minimal_lora_config.yaml \
-  --checkpoint ./checkpoints/best.pt \
-  --image ./data/test_image.jpg \
-  --prompt "a red car" \
-  --output ./output_segmentation.png \
-  --device cuda
+python3 train_sam3_lora_native.py --config configs/quick_test_config.yaml
 ```
 
-### Option 2: Python API
+### Python API
 
-Use LoRA with any PyTorch model:
+Use the trainer programmatically:
+
+```python
+from train_sam3_lora_native import SAM3TrainerNative
+
+# Create trainer with config file
+trainer = SAM3TrainerNative("configs/full_lora_config.yaml")
+
+# Train!
+trainer.train()
+```
+
+Or apply LoRA to your own models:
 
 ```python
 import torch
-from sam3_lora import LoRAConfig, inject_lora_into_model
+from lora_layers import LoRAConfig, apply_lora_to_model, count_parameters
 
 # Your existing PyTorch model
 model = YourModel()
@@ -133,60 +176,66 @@ lora_config = LoRAConfig(
         "k_proj",              # Key projection
         "v_proj",              # Value projection
         "out_proj",            # Output projection
-        "linear1",             # First FFN layer
-        "linear2"              # Second FFN layer
-    ]
+        "fc1",                 # First FFN layer
+        "fc2"                  # Second FFN layer
+    ],
+    apply_to_vision_encoder=True,
+    apply_to_text_encoder=False,
+    apply_to_geometry_encoder=False,
+    apply_to_detr_encoder=False,
+    apply_to_detr_decoder=False,
+    apply_to_mask_decoder=True,
 )
 
-# Inject LoRA
-model = inject_lora_into_model(model, lora_config, verbose=True)
+# Apply LoRA
+model = apply_lora_to_model(model, lora_config)
+
+# Check trainable parameters
+stats = count_parameters(model)
+print(f"Trainable: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)")
 
 # Train as usual
 optimizer = torch.optim.AdamW(
     [p for p in model.parameters() if p.requires_grad],
     lr=1e-4
 )
-
-# Training loop
-for epoch in range(num_epochs):
-    for batch in train_loader:
-        output = model(batch['images'])
-        loss = criterion(output, batch['targets'])
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
 ```
 
 ---
 
 ## Data Preparation
 
-### COCO Format Required
-
-The training script expects **COCO JSON format** with segmentation annotations.
+The training script expects images and individual JSON annotation files.
 
 **Directory structure:**
 ```
-your_dataset/
+data/
 ├── train/
-│   ├── image001.jpg
-│   ├── image002.jpg
-│   └── _annotations.coco.json    ← Required!
-├── valid/
-│   ├── image001.jpg
-│   ├── image002.jpg
-│   └── _annotations.coco.json
+│   ├── images/
+│   │   ├── image001.jpg
+│   │   ├── image002.jpg
+│   │   └── ...
+│   └── annotations/
+│       ├── image001.json
+│       ├── image002.json
+│       └── ...
+└── valid/
+    ├── images/
+    │   ├── image001.jpg
+    │   └── ...
+    └── annotations/
+        ├── image001.json
+        └── ...
 ```
 
-### Convert Roboflow Data
-
-If you have Roboflow format data:
-
-```bash
-python3 convert_roboflow_to_coco.py
+**Annotation format (JSON):**
+Each JSON file should contain bounding boxes and masks:
+```json
+{
+  "bboxes": [[x1, y1, x2, y2], ...],
+  "masks": [[[x, y], ...], ...]
+}
 ```
-
-This automatically converts individual JSON files to COCO format.
 
 ---
 
@@ -196,75 +245,98 @@ This automatically converts individual JSON files to COCO format.
 
 **Basic command (using YAML config):**
 ```bash
-python3 train_standalone.py --config configs/sam3_lora_standalone.yaml
+# Use default config
+python3 train_sam3_lora_native.py
+
+# Specify custom config file
+python3 train_sam3_lora_native.py --config configs/full_lora_config.yaml
 ```
 
 **All available options (configured in YAML):**
 You can customize all training and LoRA hyperparameters by modifying the YAML configuration file.
 ```yaml
-# configs/sam3_lora_standalone.yaml
-dataset:
-  data_root: "./data"
-
+# configs/full_lora_config.yaml
 lora:
-  rank: 8
-  alpha: 16.0
+  rank: 16
+  alpha: 32
   dropout: 0.1
   target_modules:
     - "q_proj"
     - "k_proj"
     - "v_proj"
     - "out_proj"
-    - "linear1"
-    - "linear2"
+    - "fc1"
+    - "fc2"
+  apply_to_vision_encoder: true
+  apply_to_text_encoder: false
+  apply_to_geometry_encoder: false
+  apply_to_detr_encoder: false
+  apply_to_detr_decoder: false
+  apply_to_mask_decoder: true
 
 training:
-  epochs: 5
-  batch_size: 2
-  learning_rate: 1e-4
+  batch_size: 1
+  num_epochs: 20
+  learning_rate: 5e-5
   weight_decay: 0.01
-  optimizer: "adamw"
-  betas: [0.9, 0.999]
 
-checkpoint:
-  save_dir: "./checkpoints"
+output:
+  output_dir: "outputs/sam3_lora_full"
 ```
+
 To run with a custom configuration, simply specify your YAML file:
 ```bash
-python3 train_standalone.py --config my_custom_config.yaml
-```
-
-**Resume training:**
-```bash
-python3 train_standalone.py \
-  --config configs/sam3_lora_standalone.yaml \
-  --resume ./checkpoints/best.pt
+python3 train_sam3_lora_native.py --config my_custom_config.yaml
 ```
 
 ### Using the Trainer API
 
 ```python
-from sam3_lora.train import SimpleLoRATrainer
-from sam3_lora import LoRAConfig
-from sam3_lora.model import SimpleSegmentationModel
+from train_sam3_lora_native import SAM3TrainerNative
 
-# Create model
-model = SimpleSegmentationModel()
-
-# Configure LoRA
-lora_config = LoRAConfig(rank=8, alpha=16.0)
-
-# Create trainer
-trainer = SimpleLoRATrainer(
-    model=model,
-    lora_config=lora_config,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    max_epochs=10,
-    save_dir="./checkpoints"
-)
+# Create trainer with config file
+trainer = SAM3TrainerNative("configs/full_lora_config.yaml")
 
 # Train!
+trainer.train()
+```
+
+Or programmatically with custom config:
+
+```python
+import yaml
+
+# Create custom config
+config = {
+    "lora": {
+        "rank": 8,
+        "alpha": 16,
+        "dropout": 0.1,
+        "target_modules": ["q_proj", "v_proj"],
+        "apply_to_vision_encoder": True,
+        "apply_to_text_encoder": False,
+        "apply_to_geometry_encoder": False,
+        "apply_to_detr_encoder": False,
+        "apply_to_detr_decoder": False,
+        "apply_to_mask_decoder": True,
+    },
+    "training": {
+        "batch_size": 1,
+        "num_epochs": 10,
+        "learning_rate": 1e-4,
+        "weight_decay": 0.01,
+    },
+    "output": {
+        "output_dir": "outputs/custom"
+    }
+}
+
+# Save config
+with open("configs/custom.yaml", "w") as f:
+    yaml.dump(config, f)
+
+# Train
+trainer = SAM3TrainerNative("configs/custom.yaml")
 trainer.train()
 ```
 
@@ -275,18 +347,26 @@ trainer.train()
 ### LoRA Parameters
 
 ```python
-LoRAConfig(
-    rank=8,              # Low-rank dimension (4, 8, 16, 32)
-    alpha=16.0,          # Scaling factor (typically 2*rank)
-    dropout=0.1,         # Dropout probability (0.0-0.3)
-    target_modules=[     # Which modules to adapt
-        "q_proj",        # Query projection (attention)
-        "k_proj",        # Key projection (attention)
-        "v_proj",        # Value projection (attention)
-        "out_proj",      # Output projection (attention)
-        "linear1",       # First FFN layer
-        "linear2"        # Second FFN layer
-    ]
+from lora_layers import LoRAConfig
+
+config = LoRAConfig(
+    rank=8,                          # Low-rank dimension (4, 8, 16, 32, 64)
+    alpha=16.0,                      # Scaling factor (typically 2*rank)
+    dropout=0.1,                     # Dropout probability (0.0-0.3)
+    target_modules=[                 # Which module types to adapt
+        "q_proj",                    # Query projection (attention)
+        "k_proj",                    # Key projection (attention)
+        "v_proj",                    # Value projection (attention)
+        "out_proj",                  # Output projection (attention)
+        "fc1",                       # First FFN layer
+        "fc2"                        # Second FFN layer
+    ],
+    apply_to_vision_encoder=True,    # Apply to vision encoder
+    apply_to_text_encoder=False,     # Apply to text encoder
+    apply_to_geometry_encoder=False, # Apply to geometry encoder
+    apply_to_detr_encoder=False,     # Apply to DETR encoder
+    apply_to_detr_decoder=False,     # Apply to DETR decoder
+    apply_to_mask_decoder=True,      # Apply to mask decoder
 )
 ```
 
@@ -297,7 +377,14 @@ LoRAConfig(
 LoRAConfig(
     rank=4,
     alpha=8.0,
-    target_modules=["q_proj", "v_proj"]
+    dropout=0.1,
+    target_modules=["q_proj", "v_proj"],
+    apply_to_vision_encoder=True,
+    apply_to_text_encoder=False,
+    apply_to_geometry_encoder=False,
+    apply_to_detr_encoder=False,
+    apply_to_detr_decoder=False,
+    apply_to_mask_decoder=False,
 )
 ```
 
@@ -306,7 +393,14 @@ LoRAConfig(
 LoRAConfig(
     rank=8,
     alpha=16.0,
-    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"]
+    dropout=0.1,
+    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+    apply_to_vision_encoder=True,
+    apply_to_text_encoder=False,
+    apply_to_geometry_encoder=False,
+    apply_to_detr_encoder=False,
+    apply_to_detr_decoder=False,
+    apply_to_mask_decoder=True,
 )
 ```
 
@@ -315,7 +409,14 @@ LoRAConfig(
 LoRAConfig(
     rank=16,
     alpha=32.0,
-    target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "linear1", "linear2"]
+    dropout=0.1,
+    target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
+    apply_to_vision_encoder=True,
+    apply_to_text_encoder=False,
+    apply_to_geometry_encoder=False,
+    apply_to_detr_encoder=True,
+    apply_to_detr_decoder=True,
+    apply_to_mask_decoder=True,
 )
 ```
 
@@ -326,120 +427,132 @@ LoRAConfig(
 ### Save LoRA Weights Only
 
 ```python
-from sam3_lora.lora import get_lora_state_dict
-import torch
+from lora_layers import save_lora_weights
 
 # Save only LoRA weights (small file!)
-lora_weights = get_lora_state_dict(model)
-torch.save({'lora_state_dict': lora_weights}, 'lora_weights.pt')
+save_lora_weights(model, 'lora_weights.pt')
+```
+
+Training automatically saves weights to the output directory specified in your config:
+```bash
+# After training completes, weights are saved to:
+# outputs/sam3_lora_full/lora_weights.pt
 ```
 
 ### Load LoRA Weights
 
 ```python
-from sam3_lora.lora import load_lora_state_dict
-import torch
+from lora_layers import load_lora_weights
 
-# Load into new model
-checkpoint = torch.load('lora_weights.pt')
-load_lora_state_dict(model, checkpoint['lora_state_dict'])
+# Load LoRA weights into a model
+load_lora_weights(model, 'lora_weights.pt')
 ```
 
-### Merge LoRA into Base Model
+### Check Parameter Counts
 
 ```python
-from sam3_lora.lora import merge_lora_weights
+from lora_layers import count_parameters
 
-# Merge LoRA weights into base model (creates full model)
-merged_model = merge_lora_weights(model)
-torch.save(merged_model.state_dict(), 'merged_model.pt')
+# Get statistics about trainable parameters
+stats = count_parameters(model)
+print(f"Trainable: {stats['trainable_parameters']:,}")
+print(f"Total: {stats['total_parameters']:,}")
+print(f"Percentage: {stats['trainable_percentage']:.2f}%")
 ```
 
 ---
 
 ## Monitoring Training
 
-### TensorBoard
+### Training Progress
+
+Monitor training progress directly in the console:
 
 ```bash
-# Start TensorBoard
-tensorboard --logdir ./checkpoints
-
-# Open browser: http://localhost:6006
+python3 train_sam3_lora_native.py --config configs/full_lora_config.yaml
+# Output shows epoch progress and loss values in real-time
 ```
 
-### Log Files
+### Saved Weights
+
+Check saved LoRA weights:
 
 ```bash
-# Watch training progress
-tail -f checkpoints/training.log
-
-# List checkpoints (only best.pt and last.pt are saved)
-ls -lh checkpoints/
+# List saved weights (location based on your config's output_dir)
+ls -lh outputs/sam3_lora_full/
+# Output: lora_weights.pt
 ```
 
 ---
 
 ## Examples
 
-### Example 1: Train on Your Data
+### Example 1: Quick Test Training
 
-```python
-from sam3_lora.train import SimpleLoRATrainer
-from sam3_lora import LoRAConfig
-from sam3_lora.model import SimpleSegmentationModel
-from sam3_lora.data import create_dataloaders
+```bash
+# Create a config for quick testing
+cat > configs/quick_test.yaml << EOF
+lora:
+  rank: 4
+  alpha: 8
+  dropout: 0.1
+  target_modules: ["q_proj", "v_proj"]
+  apply_to_vision_encoder: true
+  apply_to_text_encoder: false
+  apply_to_geometry_encoder: false
+  apply_to_detr_encoder: false
+  apply_to_detr_decoder: false
+  apply_to_mask_decoder: false
 
-# Create dataloaders
-train_loader, val_loader = create_dataloaders(
-    data_root="./data",
-    batch_size=2
-)
+training:
+  batch_size: 1
+  num_epochs: 5
+  learning_rate: 1e-4
+  weight_decay: 0.01
 
-# Create model
-model = SimpleSegmentationModel()
+output:
+  output_dir: "outputs/quick_test"
+EOF
 
-# Configure LoRA
-lora_config = LoRAConfig(rank=8, alpha=16.0)
-
-# Create trainer
-trainer = SimpleLoRATrainer(
-    model=model,
-    lora_config=lora_config,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    max_epochs=10,
-    save_dir="./checkpoints"
-)
-
-# Train!
-trainer.train()
+# Run training
+python3 train_sam3_lora_native.py --config configs/quick_test.yaml
 ```
 
-### Example 2: Custom Loss Function
+### Example 2: Production Training
 
-```python
-from sam3_lora.train import SimpleLoRATrainer
-import torch.nn.functional as F
+```bash
+# Create a config for production
+cat > configs/production.yaml << EOF
+lora:
+  rank: 32
+  alpha: 64
+  dropout: 0.1
+  target_modules: ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+  apply_to_vision_encoder: true
+  apply_to_text_encoder: false
+  apply_to_geometry_encoder: false
+  apply_to_detr_encoder: true
+  apply_to_detr_decoder: true
+  apply_to_mask_decoder: true
 
-class MyTrainer(SimpleLoRATrainer):
-    def compute_loss(self, batch):
-        """Override to use custom loss."""
-        output = self.model(batch['images'])
-        targets = batch['masks']
+training:
+  batch_size: 2
+  num_epochs: 50
+  learning_rate: 3e-5
+  weight_decay: 0.01
 
-        # Your custom loss
-        loss = F.binary_cross_entropy_with_logits(output, targets)
-        return loss
+output:
+  output_dir: "outputs/production"
+EOF
 
-trainer = MyTrainer(model, lora_config, train_loader)
-trainer.train()
+# Run training
+python3 train_sam3_lora_native.py --config configs/production.yaml
 ```
 
-### Example 3: Apply LoRA to Your Model
+### Example 3: Apply LoRA to Your Own Model
 
 ```python
-from sam3_lora import LoRAConfig, inject_lora_into_model
+from lora_layers import LoRAConfig, apply_lora_to_model, count_parameters
 import torch.nn as nn
 
 # Your existing PyTorch model
@@ -458,14 +571,21 @@ model = MyModel()
 lora_config = LoRAConfig(
     rank=8,
     alpha=16.0,
-    target_modules=["q_proj", "k_proj", "v_proj"]
+    dropout=0.1,
+    target_modules=["q_proj", "k_proj", "v_proj"],
+    apply_to_vision_encoder=True,
+    apply_to_text_encoder=False,
+    apply_to_geometry_encoder=False,
+    apply_to_detr_encoder=False,
+    apply_to_detr_decoder=False,
+    apply_to_mask_decoder=False,
 )
-model = inject_lora_into_model(model, lora_config)
+model = apply_lora_to_model(model, lora_config)
 
-# Now only LoRA parameters are trainable!
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total = sum(p.numel() for p in model.parameters())
-print(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+# Check trainable parameters
+stats = count_parameters(model)
+print(f"Trainable: {stats['trainable_parameters']:,} / {stats['total_parameters']:,}")
+print(f"Percentage: {stats['trainable_percentage']:.2f}%")
 ```
 
 ---
@@ -474,36 +594,32 @@ print(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
 ```
 sam3_lora/
-├── sam3/                          # Full SAM3 library code (bundled for standalone)
+├── sam3/                          # Full SAM3 library code
 │   ├── assets/                    # BPE vocab, etc.
-│   └── ...                        # Other SAM3 modules
+│   ├── model/                     # SAM3 model architecture
+│   ├── train/                     # SAM3 training utilities
+│   │   ├── loss/                  # Loss functions
+│   │   ├── matcher.py             # Hungarian matcher
+│   │   └── data/                  # Data loading utilities
+│   └── model_builder.py           # Model construction
 │
-├── sam3_lora/                     # Main LoRA package
-│   ├── __init__.py                # Package exports
-│   ├── lora/                      # LoRA implementation
-│   │   ├── lora_layer.py          # Core LoRA layers
-│   │   └── lora_utils.py          # Utilities
-│   ├── data/                      # Data loading
-│   │   └── dataset.py             # COCO dataset loader
-│   ├── model/                     # Simple models
-│   │   └── simple_models.py       # For testing/demos
-│   ├── train/                     # Training
-│   │   └── trainer.py             # Standalone trainer
-│   └── utils/                     # Utilities
-│       └── training_utils.py
+├── configs/                       # YAML configuration files
+│   └── full_lora_config.yaml      # Default training config
 │
 ├── data/                          # Your training data
 │   ├── train/
+│   │   ├── images/                # Training images
+│   │   └── annotations/           # JSON annotations
 │   └── valid/
+│       ├── images/                # Validation images
+│       └── annotations/           # JSON annotations
 │
-├── setup.py                       # Installation script
-├── requirements.txt               # Dependencies
-├── train_standalone.py            # Standalone training script
-├── train.py                       # Full SAM3 LoRA training script
-├── inference_standalone.py        # Standalone LoRA inference script
-├── inference_real.py              # Full SAM3 LoRA inference script
-├── test_standalone.py             # Test script
-├── convert_roboflow_to_coco.py    # Data conversion
+├── outputs/                       # Training outputs
+│   └── sam3_lora_full/
+│       └── lora_weights.pt        # Saved LoRA weights
+│
+├── lora_layers.py                 # LoRA implementation
+├── train_sam3_lora_native.py      # Main training script (CLI + YAML)
 └── README.md                      # This file
 ```
 
@@ -530,22 +646,22 @@ pip install -e .
 ```
 
 **3. CUDA Out of Memory**
-```bash
-# Reduce batch size and rank
-python3 train_standalone.py \
-  --data-root ./data \
-  --batch-size 1 \
-  --rank 4
+```yaml
+# Edit your config file to reduce batch size and rank
+training:
+  batch_size: 1
+
+lora:
+  rank: 4
 ```
 
 **4. Data Not Found**
 ```bash
-# Make sure you have COCO format data
-ls data/train/_annotations.coco.json
-ls data/valid/_annotations.coco.json
-
-# If you have Roboflow format, convert it
-python3 convert_roboflow_to_coco.py
+# Make sure you have data with proper structure
+ls data/train/images/
+ls data/train/annotations/
+ls data/valid/images/
+ls data/valid/annotations/
 ```
 
 ### Getting Help
@@ -553,8 +669,8 @@ python3 convert_roboflow_to_coco.py
 If you encounter issues:
 
 1. Check the [Troubleshooting](#troubleshooting) section
-2. Review example scripts (`test_standalone.py`, `train_standalone.py`)
-3. Ensure data is in COCO format
+2. Review the training script (`train_sam3_lora_native.py`)
+3. Ensure data is in proper format (images + JSON annotations)
 4. Check that the package is installed (`pip install -e .`)
 
 ---
@@ -597,7 +713,9 @@ If you use this work, please cite:
 ```bibtex
 @software{sam3_lora,
   title = {SAM3-LoRA: Low-Rank Adaptation for Fine-Tuning},
+  author = {AI Research Group, KMUTT},
   year = {2025},
+  organization = {King Mongkut's University of Technology Thonburi},
   url = {https://github.com/yourusername/sam3_lora}
 }
 ```
@@ -615,13 +733,19 @@ This project is licensed under Apache 2.0. See [LICENSE](LICENSE) for details.
 
 ---
 
+## Credits
+
+Developed by **AI Research Group, KMUTT** (King Mongkut's University of Technology Thonburi)
+
+---
+
 ## Status
 
-- ✅ **Truly Standalone Package**: Full SAM3 library code bundled, tested, production-ready
+- ✅ **SAM3 LoRA Training**: Full SAM3 model with LoRA fine-tuning via CLI
+- ✅ **YAML Configuration**: Flexible config file system with CLI argument support
 - ✅ **LoRA Implementation**: Complete with all utilities and enhanced injection
-- ✅ **Data Loading**: COCO format support
-- ✅ **Training**: Standalone and real SAM3 training working with YAML config
-- ✅ **Inference**: Standalone and real SAM3 inference scripts available
+- ✅ **Data Loading**: Custom dataset format with individual JSON annotations
+- ✅ **Production Ready**: Tested and working training pipeline
 - ✅ **Documentation**: Comprehensive guides and examples
 
 ---
@@ -631,6 +755,9 @@ This project is licensed under Apache 2.0. See [LICENSE](LICENSE) for details.
 **Version**: 0.1.0
 **Python**: 3.8+
 **PyTorch**: 2.0+
+
+**Made by AI Research Group, KMUTT**
+*King Mongkut's University of Technology Thonburi*
 
 **Built with ❤️ for the research community**
 

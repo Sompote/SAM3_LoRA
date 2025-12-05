@@ -24,17 +24,17 @@ lora:
 
   # Apply LoRA to ALL components
   apply_to_vision_encoder: true
-  apply_to_text_encoder: true
-  apply_to_geometry_encoder: true
-  apply_to_detr_encoder: true
-  apply_to_detr_decoder: true
+  apply_to_text_encoder: false
+  apply_to_geometry_encoder: false
+  apply_to_detr_encoder: false
+  apply_to_detr_decoder: false
   apply_to_mask_decoder: true
 
 # Training settings
 training:
-train_data_path: "/workspace/sam3_lora/data/trainn"
+  train_data_path: "data/train"
   val_data_path: "/workspace/sam3_lora/data/valid"
-  batch_size: 2              # Smaller batch due to more parameters
+  batch_size: 1              # Smaller batch due to more parameters
   num_workers: 4
 
   learning_rate: 5e-5        # Lower LR for stability

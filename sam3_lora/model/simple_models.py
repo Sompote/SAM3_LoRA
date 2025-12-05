@@ -70,6 +70,29 @@ class SeparatedTransformerEncoderLayer(nn.TransformerEncoderLayer):
         # Replace self_attn with our separated version
         self.self_attn = SeparatedMultiheadAttention(d_model, nhead, dropout=dropout, bias=bias)
 
+    def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal=False):
+        # Standard TransformerEncoderLayer forward without fast path checks
+        x = src
+        if self.norm_first:
+            x = x + self._sa_block(self.norm1(x), src_mask, src_key_padding_mask, is_causal=is_causal)
+            x = x + self._ff_block(self.norm2(x))
+        else:
+            x = self.norm1(x + self._sa_block(x, src_mask, src_key_padding_mask, is_causal=is_causal))
+            x = self.norm2(x + self._ff_block(x))
+        return x
+
+    def _sa_block(self, x, attn_mask, key_padding_mask, is_causal=False):
+        x = self.self_attn(x, x, x,
+                           attn_mask=attn_mask,
+                           key_padding_mask=key_padding_mask,
+                           is_causal=is_causal,
+                           need_weights=False)[0]
+        return self.dropout1(x)
+
+    def _ff_block(self, x):
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        return self.dropout2(x)
+
 
 class SimpleTransformer(nn.Module):
     """

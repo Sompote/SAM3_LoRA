@@ -171,21 +171,26 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
         """Determine if LoRA should be applied to this module."""
 
         # Check component-level flags
-        if "vision_encoder" in module_name and not config.apply_to_vision_encoder:
+        if ("vision_encoder" in module_name or "vision_backbone" in module_name) and not config.apply_to_vision_encoder:
             return False
-        if "text_encoder" in module_name and not config.apply_to_text_encoder:
+        if ("text_encoder" in module_name or "language_backbone" in module_name) and not config.apply_to_text_encoder:
             return False
         if "geometry_encoder" in module_name and not config.apply_to_geometry_encoder:
             return False
-        if "detr_encoder" in module_name and not config.apply_to_detr_encoder:
+        if ("detr_encoder" in module_name or "transformer.encoder" in module_name) and not config.apply_to_detr_encoder:
             return False
-        if "detr_decoder" in module_name and not config.apply_to_detr_decoder:
+        if ("detr_decoder" in module_name or "transformer.decoder" in module_name) and not config.apply_to_detr_decoder:
             return False
         if "mask_decoder" in module_name and not config.apply_to_mask_decoder:
             return False
 
         # Check if module name matches target modules
         module_basename = module_name.split('.')[-1]
+        
+        # Skip out_proj to avoid breaking nn.MultiheadAttention which accesses .weight directly
+        if module_basename == "out_proj":
+            return False
+            
         return module_basename in config.target_modules
 
     # Track replacements

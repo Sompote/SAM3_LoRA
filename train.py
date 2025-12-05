@@ -41,8 +41,8 @@ def create_optimizer(model: nn.Module, config: dict) -> torch.optim.Optimizer:
     lora_params = [p for p in model.parameters() if p.requires_grad]
 
     optimizer_name = config["training"]["optimizer"].lower()
-    lr = config["training"]["learning_rate"]
-    weight_decay = config["training"]["weight_decay"]
+    lr = float(config["training"]["learning_rate"])
+    weight_decay = float(config["training"]["weight_decay"])
 
     if optimizer_name == "adamw":
         optimizer = torch.optim.AdamW(
@@ -193,7 +193,7 @@ def main():
     logging.info("Creating trainer...")
 
     # For now, create a dummy optimizer that will be replaced
-    dummy_optimizer = torch.optim.AdamW(model.parameters(), lr=config["training"]["learning_rate"])
+    dummy_optimizer = torch.optim.AdamW(model.parameters(), lr=float(config["training"]["learning_rate"]))
 
     trainer = LoRATrainer(
         model=model,
