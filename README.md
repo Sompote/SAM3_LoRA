@@ -158,10 +158,17 @@ Epoch 2/20 - Validation Loss: 0.290000
 ### 3. Run Inference
 
 ```bash
-# Segment objects in new images (automatically uses best model)
+# Basic inference (automatically uses best model)
 python3 inference_lora.py \
   --config configs/full_lora_config.yaml \
   --image test_image.jpg \
+  --output predictions.png
+
+# With text prompt for better accuracy
+python3 inference_lora.py \
+  --config configs/full_lora_config.yaml \
+  --image test_image.jpg \
+  --prompt "yellow school bus" \
   --output predictions.png
 
 # Or specify weights explicitly
@@ -169,6 +176,7 @@ python3 inference_lora.py \
   --config configs/full_lora_config.yaml \
   --weights outputs/sam3_lora_full/best_lora_weights.pt \
   --image test_image.jpg \
+  --prompt "person wearing red hat" \
   --output predictions.png
 ```
 
@@ -261,6 +269,8 @@ During training, two models are automatically saved:
 
 ## Inference
 
+Run inference on new images using your trained LoRA model. Text prompts are **highly recommended** for better accuracy and to guide the model toward specific objects.
+
 ### Command Line
 
 ```bash
@@ -270,20 +280,65 @@ python3 inference_lora.py \
   --image path/to/image.jpg \
   --output predictions.png
 
+# With text prompt (recommended for better accuracy)
+python3 inference_lora.py \
+  --config configs/full_lora_config.yaml \
+  --image path/to/image.jpg \
+  --prompt "yellow school bus" \
+  --output predictions.png
+
+# Multiple object types with text prompt
+python3 inference_lora.py \
+  --config configs/full_lora_config.yaml \
+  --image street_scene.jpg \
+  --prompt "car" \
+  --output car_segmentation.png
+
 # Use last epoch model instead
 python3 inference_lora.py \
   --config configs/full_lora_config.yaml \
   --weights outputs/sam3_lora_full/last_lora_weights.pt \
   --image path/to/image.jpg \
+  --prompt "person with red backpack" \
   --output predictions.png
 
 # With custom confidence threshold
 python3 inference_lora.py \
   --config configs/full_lora_config.yaml \
   --image path/to/image.jpg \
+  --prompt "building" \
   --threshold 0.7 \
   --output predictions.png
 ```
+
+### Text Prompts
+
+Text prompts help guide the model to segment specific objects more accurately:
+
+**Good text prompts:**
+- `"yellow school bus"` - Specific color and object type
+- `"person wearing red hat"` - Object with distinctive features
+- `"car"` - Simple, clear object type
+- `"dog sitting on grass"` - Object with context
+- `"building with glass windows"` - Object with distinguishing features
+
+**Tips for better prompts:**
+- Be specific but concise
+- Include distinctive colors or features
+- Use natural language descriptions
+- Avoid overly complex or ambiguous descriptions
+- Match the vocabulary to your training data
+
+### Inference Parameters
+
+| Parameter | Description | Example | Default |
+|-----------|-------------|---------|---------|
+| `--config` | Path to training config file | `configs/full_lora_config.yaml` | Required |
+| `--weights` | Path to LoRA weights (optional) | `outputs/sam3_lora_full/best_lora_weights.pt` | Auto-detected |
+| `--image` | Input image path | `test_image.jpg` | Required |
+| `--prompt` | Text prompt for segmentation | `"yellow school bus"` | None (uses "object") |
+| `--output` | Output visualization path | `predictions.png` | `output.png` |
+| `--threshold` | Confidence threshold (0.0-1.0) | `0.7` | `0.5` |
 
 ### Python API
 
@@ -296,20 +351,28 @@ inferencer = SAM3LoRAInference(
     weights_path="outputs/sam3_lora_full/lora_weights.pt"
 )
 
-# Run prediction
+# Run prediction without text prompt
 predictions = inferencer.predict("image.jpg")
+
+# Run prediction with text prompt (recommended)
+predictions = inferencer.predict(
+    image_path="image.jpg",
+    text_prompt="yellow school bus"
+)
 
 # Visualize results
 inferencer.visualize_predictions(
     predictions,
     output_path="output.png",
-    confidence_threshold=0.5
+    confidence_threshold=0.5,
+    text_prompt="yellow school bus"  # Optional: shows prompt in title
 )
 
 # Access raw predictions
-boxes = predictions['boxes']        # Bounding boxes
-scores = predictions['scores']      # Confidence scores
-masks = predictions['masks']        # Segmentation masks
+boxes = predictions['boxes']        # Bounding boxes [N, 4]
+scores = predictions['scores']      # Confidence scores [N, num_classes]
+masks = predictions['masks']        # Segmentation masks [N, H, W]
+original_size = predictions['original_size']  # (width, height)
 ```
 
 ---
@@ -400,11 +463,19 @@ EOF
 # Train
 python3 train_sam3_lora_native.py --config configs/quick_test.yaml
 
-# Inference
+# Inference without text prompt
 python3 inference_lora.py \
   --config configs/quick_test.yaml \
   --weights outputs/quick_test/lora_weights.pt \
   --image test.jpg \
+  --output result.png
+
+# Inference with text prompt (better results)
+python3 inference_lora.py \
+  --config configs/quick_test.yaml \
+  --weights outputs/quick_test/lora_weights.pt \
+  --image test.jpg \
+  --prompt "car" \
   --output result.png
 ```
 
@@ -451,7 +522,7 @@ trainer.train()
 # Weights saved to: outputs/sam3_lora_full/lora_weights.pt
 ```
 
-### Example 4: Batch Inference
+### Example 4: Batch Inference with Text Prompts
 
 ```python
 from inference_lora import SAM3LoRAInference
@@ -463,18 +534,42 @@ inferencer = SAM3LoRAInference(
     weights_path="outputs/sam3_lora_full/lora_weights.pt"
 )
 
-# Process multiple images
+# Process multiple images with same prompt
 image_dir = Path("test_images")
 output_dir = Path("predictions")
 output_dir.mkdir(exist_ok=True)
 
+text_prompt = "car"  # Segment cars in all images
+
 for img_path in image_dir.glob("*.jpg"):
-    predictions = inferencer.predict(str(img_path))
+    predictions = inferencer.predict(
+        str(img_path),
+        text_prompt=text_prompt
+    )
 
     output_path = output_dir / f"{img_path.stem}_pred.png"
-    inferencer.visualize_predictions(predictions, str(output_path))
+    inferencer.visualize_predictions(
+        predictions,
+        str(output_path),
+        text_prompt=text_prompt
+    )
 
     print(f"✓ Processed {img_path.name}")
+
+# Or process with different prompts per image
+image_prompts = {
+    "street1.jpg": "yellow school bus",
+    "street2.jpg": "person with red hat",
+    "parking.jpg": "car"
+}
+
+for img_name, prompt in image_prompts.items():
+    img_path = image_dir / img_name
+    if img_path.exists():
+        predictions = inferencer.predict(str(img_path), text_prompt=prompt)
+        output_path = output_dir / f"{img_path.stem}_{prompt.replace(' ', '_')}.png"
+        inferencer.visualize_predictions(predictions, str(output_path), text_prompt=prompt)
+        print(f"✓ Processed {img_name} with prompt '{prompt}'")
 ```
 
 ---

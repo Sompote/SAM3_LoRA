@@ -44,7 +44,7 @@ training:
   max_grad_norm: 1.0         # Gradient clipping
 
   # Schedule
-  num_epochs: 10
+  num_epochs: 200
   warmup_steps: 500
   lr_scheduler: "cosine"     # Options: cosine, linear, constant
 

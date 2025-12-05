@@ -145,21 +145,30 @@ class SAM3LoRAInference:
     @torch.no_grad()
     def predict(self, image_path, text_prompt=None):
         """
-        Run inference on an image.
+        Run inference on an image with optional text prompt.
 
         Args:
             image_path: Path to input image
-            text_prompt: Optional text prompt (currently uses generic "object")
+            text_prompt: Optional text prompt to guide segmentation (e.g., "yellow school bus", "person wearing hat")
+                        If None, uses generic "object" query.
 
         Returns:
-            Dictionary containing predictions
+            Dictionary containing predictions:
+                - boxes: Predicted bounding boxes [N, 4] in normalized coords
+                - scores: Confidence scores [N, num_classes]
+                - masks: Segmentation masks [N, H, W] (if available)
+                - original_size: Original image size (width, height)
+                - image: PIL Image object
         """
         # Prepare input
         datapoint, original_image, (orig_w, orig_h) = self.prepare_image(image_path)
 
         # Override text prompt if provided
         if text_prompt:
+            print(f"Using text prompt: '{text_prompt}'")
             datapoint.find_queries[0].query_text = text_prompt
+        else:
+            print("Using generic 'object' query (consider adding --prompt for better results)")
 
         # Collate into batch
         batch_dict = collate_fn_api([datapoint], dict_key="input", with_seg_masks=True)
@@ -212,7 +221,7 @@ class SAM3LoRAInference:
             return obj
         return obj
 
-    def visualize_predictions(self, predictions, output_path, confidence_threshold=0.5):
+    def visualize_predictions(self, predictions, output_path, confidence_threshold=0.5, text_prompt=None):
         """
         Visualize predictions on the image.
 
@@ -220,6 +229,7 @@ class SAM3LoRAInference:
             predictions: Dictionary from predict()
             output_path: Where to save the visualization
             confidence_threshold: Minimum confidence to show predictions
+            text_prompt: Optional text prompt to display in title
         """
         image = predictions['image']
         boxes = predictions['boxes']
@@ -282,6 +292,11 @@ class SAM3LoRAInference:
                 ax.imshow(colored_mask)
 
         ax.axis('off')
+
+        # Add title with text prompt if provided
+        if text_prompt:
+            plt.suptitle(f'Text Prompt: "{text_prompt}"', fontsize=12, y=0.98)
+
         plt.tight_layout()
         plt.savefig(output_path, bbox_inches='tight', dpi=150)
         print(f"✅ Saved visualization to {output_path}")
@@ -312,7 +327,7 @@ def main():
         "--prompt",
         type=str,
         default=None,
-        help="Optional text prompt for segmentation"
+        help='Text prompt to guide segmentation (e.g., "yellow school bus", "person with red hat", "car"). Improves accuracy for specific objects.'
     )
     parser.add_argument(
         "--output",
@@ -358,10 +373,12 @@ def main():
     predictions = inferencer.predict(args.image, args.prompt)
 
     # Visualize results
-    inferencer.visualize_predictions(predictions, args.output, args.threshold)
+    inferencer.visualize_predictions(predictions, args.output, args.threshold, text_prompt=args.prompt)
 
     # Print summary
     print("\n📊 Prediction Summary:")
+    if args.prompt:
+        print(f"  Text prompt: '{args.prompt}'")
     print(f"  Detected objects: {(predictions['scores'].max(axis=1) > args.threshold).sum()}")
     print(f"  Max confidence: {predictions['scores'].max():.3f}")
     print(f"  Output saved to: {args.output}")
