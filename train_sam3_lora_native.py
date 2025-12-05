@@ -205,13 +205,22 @@ class SAM3TrainerNative:
     def train(self):
         train_ds = SimpleSAM3Dataset("data", image_set="train")
 
-        # Check if validation data exists
-        try:
-            val_ds = SimpleSAM3Dataset("data", image_set="valid")
-            has_validation = len(val_ds) > 0
-        except:
+        # Check if validation data exists (try both "valid" and "val")
+        has_validation = False
+        val_ds = None
+
+        for val_name in ["valid", "val"]:
+            try:
+                val_ds = SimpleSAM3Dataset("data", image_set=val_name)
+                if len(val_ds) > 0:
+                    has_validation = True
+                    print(f"Found validation data in data/{val_name}/")
+                    break
+            except:
+                continue
+
+        if not has_validation:
             val_ds = None
-            has_validation = False
 
         def collate_fn(batch):
             return collate_fn_api(batch, dict_key="input", with_seg_masks=True)
