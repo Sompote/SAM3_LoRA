@@ -60,42 +60,56 @@ class SimpleSAM3Dataset(Dataset):
         # Load annotation
         with open(ann_path, "r") as f:
             ann_data = json.load(f)
-            
+
         objects = []
-        bboxes = ann_data.get("bboxes", [])
-        masks = ann_data.get("masks", [])
-        
+
+        # Handle the actual annotation format: {"annotations": [{"bbox": [...], "segmentation": {...}}]}
+        annotations = ann_data.get("annotations", [])
+
         # Scale factors
         scale_w = self.resolution / orig_w
         scale_h = self.resolution / orig_h
-        
-        if not bboxes:
-             # Dummy object to avoid crash?
-             pass
 
-        for i, bbox in enumerate(bboxes):
-            # Assuming bbox is [x1, y1, x2, y2]
-            box_tensor = torch.tensor(bbox, dtype=torch.float32)
+        for i, ann in enumerate(annotations):
+            # Get bbox - format is [x, y, width, height] in COCO format
+            bbox_coco = ann.get("bbox", None)
+            if bbox_coco is None:
+                continue
+
+            # Convert from COCO [x, y, w, h] to [x1, y1, x2, y2]
+            x, y, w, h = bbox_coco
+            box_tensor = torch.tensor([x, y, x + w, y + h], dtype=torch.float32)
             
             # Scale box
             box_tensor[0] *= scale_w
             box_tensor[2] *= scale_w
             box_tensor[1] *= scale_h
             box_tensor[3] *= scale_h
-            
+
+            # Handle segmentation mask (RLE encoded)
             segment = None
-            if i < len(masks):
-                mask_np = np.array(masks[i], dtype=bool)
-                # Resize mask
-                # Mask resizing is tricky. For now we skip or assume mask is on original image.
-                # If we pass mask to object, it should match image size?
-                # Sam3Image expects mask? 
-                # The loss needs valid masks. 
-                # We need to resize mask to 1008x1008.
-                # Use torch interpolation.
-                mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0) # 1,1,H,W
-                mask_t = torch.nn.functional.interpolate(mask_t, size=(self.resolution, self.resolution), mode="nearest")
-                segment = mask_t.squeeze() > 0.5
+            segmentation = ann.get("segmentation", None)
+            if segmentation and isinstance(segmentation, dict):
+                # RLE format: {"counts": "...", "size": [h, w]}
+                try:
+                    from pycocotools import mask as mask_utils
+                    # Decode RLE to binary mask
+                    mask_np = mask_utils.decode(segmentation)  # Returns [H, W] binary mask
+
+                    # Resize mask to model resolution
+                    mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+                    mask_t = torch.nn.functional.interpolate(
+                        mask_t,
+                        size=(self.resolution, self.resolution),
+                        mode="nearest"
+                    )
+                    segment = mask_t.squeeze() > 0.5  # [1008, 1008] boolean tensor
+                except ImportError:
+                    print("Warning: pycocotools not installed, skipping mask")
+                    segment = None
+                except Exception as e:
+                    print(f"Warning: Error decoding mask: {e}")
+                    segment = None
             
             obj = Object(
                 bbox=box_tensor,
