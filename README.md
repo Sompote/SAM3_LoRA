@@ -94,7 +94,7 @@ Before installing, you need to:
 ```bash
 # Clone repository
 git clone https://github.com/yourusername/sam3_lora.git
-cd sam3_lora
+cd SAM3_LoRA
 
 # Install dependencies
 pip install -e .
