@@ -226,12 +226,82 @@ class COCOSegmentDataset(Dataset):
         )
 
 
-def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=288, score_threshold=0.0):
+def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
+    """
+    Merge overlapping masks that likely represent the same object.
+
+    Args:
+        binary_masks: Binary masks [N, H, W]
+        scores: Confidence scores [N]
+        boxes: Bounding boxes [N, 4]
+        iou_threshold: IoU threshold for merging (default: 0.3)
+
+    Returns:
+        Tuple of (merged_masks, merged_scores, merged_boxes)
+    """
+    if len(binary_masks) == 0:
+        return binary_masks, scores, boxes
+
+    # Sort by score (highest first)
+    sorted_indices = torch.argsort(scores, descending=True)
+    binary_masks = binary_masks[sorted_indices]
+    scores = scores[sorted_indices]
+    boxes = boxes[sorted_indices]
+
+    merged_masks = []
+    merged_scores = []
+    merged_boxes = []
+    used = torch.zeros(len(binary_masks), dtype=torch.bool)
+
+    for i in range(len(binary_masks)):
+        if used[i]:
+            continue
+
+        current_mask = binary_masks[i].clone()
+        current_score = scores[i].item()
+        current_box = boxes[i]
+        used[i] = True
+
+        # Find overlapping masks and merge them
+        for j in range(i + 1, len(binary_masks)):
+            if used[j]:
+                continue
+
+            # Compute IoU
+            intersection = (current_mask & binary_masks[j]).sum().item()
+            union = (current_mask | binary_masks[j]).sum().item()
+            iou = intersection / union if union > 0 else 0
+
+            # If overlaps significantly, merge it
+            if iou > iou_threshold:
+                current_mask = current_mask | binary_masks[j]
+                current_score = max(current_score, scores[j].item())
+                used[j] = True
+
+        merged_masks.append(current_mask)
+        merged_scores.append(current_score)
+        merged_boxes.append(current_box)
+
+    if len(merged_masks) > 0:
+        merged_masks = torch.stack(merged_masks)
+        merged_scores = torch.tensor(merged_scores, device=scores.device)
+        merged_boxes = torch.stack(merged_boxes)
+    else:
+        merged_masks = binary_masks[:0]
+        merged_scores = scores[:0]
+        merged_boxes = boxes[:0]
+
+    return merged_masks, merged_scores, merged_boxes
+
+
+def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=288, score_threshold=0.0, merge_overlaps=True, iou_threshold=0.3):
     """Convert model predictions to COCO format"""
     coco_predictions = []
     pred_id = 0
 
     print(f"\n[DEBUG] Converting {len(predictions_list)} predictions to COCO format...")
+    if merge_overlaps:
+        print(f"[DEBUG] Overlapping segment merging ENABLED (IoU threshold={iou_threshold})")
 
     for img_id, preds in zip(image_ids, predictions_list):
         if preds is None or len(preds.get('pred_logits', [])) == 0:
@@ -258,6 +328,15 @@ def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=2
 
         # Convert masks to binary (apply sigmoid first, then threshold)
         binary_masks = (torch.sigmoid(masks) > 0.5).cpu()
+
+        # Merge overlapping predictions to avoid over-segmentation penalty
+        if merge_overlaps and len(binary_masks) > 0:
+            num_before_merge = len(binary_masks)
+            binary_masks, scores, boxes = merge_overlapping_masks(
+                binary_masks, scores.cpu(), boxes.cpu(), iou_threshold=iou_threshold
+            )
+            if img_id == image_ids[0]:
+                print(f"[DEBUG]   Merged {num_before_merge} predictions -> {len(binary_masks)} (IoU threshold={iou_threshold})")
 
         if len(binary_masks) > 0:
             mask_areas = binary_masks.flatten(1).sum(1)
@@ -530,11 +609,14 @@ def validate(config_path, weights_path, num_samples=None):
         print(f"[DEBUG] All prediction scores: min={min(all_scores):.4f}, max={max(all_scores):.4f}, mean={np.mean(all_scores):.4f}")
 
     # Convert predictions (at native 288×288 - fast!)
+    # Enable overlapping segment merging to match training evaluation
     coco_predictions = convert_predictions_to_coco_format(
         all_predictions,
         all_image_ids,
         resolution=288,
-        score_threshold=0.05
+        score_threshold=0.05,
+        merge_overlaps=True,
+        iou_threshold=0.3
     )
 
     print(f"\n[INFO] Total predictions after filtering (score > 0.05): {len(coco_predictions)}")
@@ -545,7 +627,9 @@ def validate(config_path, weights_path, num_samples=None):
             all_predictions,
             all_image_ids,
             resolution=288,
-            score_threshold=0.01
+            score_threshold=0.01,
+            merge_overlaps=True,
+            iou_threshold=0.3
         )
         print(f"[INFO] Predictions with score > 0.01: {len(coco_predictions)}")
 
@@ -555,7 +639,9 @@ def validate(config_path, weights_path, num_samples=None):
             all_predictions,
             all_image_ids,
             resolution=288,
-            score_threshold=0.0
+            score_threshold=0.0,
+            merge_overlaps=True,
+            iou_threshold=0.3
         )
         print(f"[INFO] All predictions (no threshold): {len(coco_predictions)}")
 

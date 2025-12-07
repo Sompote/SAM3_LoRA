@@ -222,7 +222,75 @@ class COCOSegmentDataset(Dataset):
         )
 
 
-def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=288, score_threshold=0.0, debug=False):
+def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
+    """
+    Merge overlapping masks that likely represent the same object.
+
+    Args:
+        binary_masks: Binary masks [N, H, W]
+        scores: Confidence scores [N]
+        boxes: Bounding boxes [N, 4]
+        iou_threshold: IoU threshold for merging (default: 0.3)
+
+    Returns:
+        Tuple of (merged_masks, merged_scores, merged_boxes)
+    """
+    if len(binary_masks) == 0:
+        return binary_masks, scores, boxes
+
+    # Sort by score (highest first)
+    sorted_indices = torch.argsort(scores, descending=True)
+    binary_masks = binary_masks[sorted_indices]
+    scores = scores[sorted_indices]
+    boxes = boxes[sorted_indices]
+
+    merged_masks = []
+    merged_scores = []
+    merged_boxes = []
+    used = torch.zeros(len(binary_masks), dtype=torch.bool)
+
+    for i in range(len(binary_masks)):
+        if used[i]:
+            continue
+
+        current_mask = binary_masks[i].clone()
+        current_score = scores[i].item()
+        current_box = boxes[i]
+        used[i] = True
+
+        # Find overlapping masks and merge them
+        for j in range(i + 1, len(binary_masks)):
+            if used[j]:
+                continue
+
+            # Compute IoU
+            intersection = (current_mask & binary_masks[j]).sum().item()
+            union = (current_mask | binary_masks[j]).sum().item()
+            iou = intersection / union if union > 0 else 0
+
+            # If overlaps significantly, merge it
+            if iou > iou_threshold:
+                current_mask = current_mask | binary_masks[j]
+                current_score = max(current_score, scores[j].item())
+                used[j] = True
+
+        merged_masks.append(current_mask)
+        merged_scores.append(current_score)
+        merged_boxes.append(current_box)
+
+    if len(merged_masks) > 0:
+        merged_masks = torch.stack(merged_masks)
+        merged_scores = torch.tensor(merged_scores, device=scores.device)
+        merged_boxes = torch.stack(merged_boxes)
+    else:
+        merged_masks = binary_masks[:0]
+        merged_scores = scores[:0]
+        merged_boxes = boxes[:0]
+
+    return merged_masks, merged_scores, merged_boxes
+
+
+def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=288, score_threshold=0.0, merge_overlaps=True, iou_threshold=0.3, debug=False):
     """
     Convert model predictions to COCO format for evaluation.
 
@@ -234,6 +302,8 @@ def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=2
         image_ids: List of image IDs corresponding to predictions
         resolution: Mask resolution for evaluation (default: 288, model's native output)
         score_threshold: Minimum score threshold for predictions
+        merge_overlaps: Whether to merge overlapping predictions (default: True)
+        iou_threshold: IoU threshold for merging overlaps (default: 0.3)
         debug: Print debug information
 
     Returns:
@@ -265,6 +335,15 @@ def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=2
 
         # Convert masks to binary (apply sigmoid first, then threshold)
         binary_masks = (torch.sigmoid(masks) > 0.5).cpu()
+
+        # Merge overlapping predictions to avoid over-segmentation penalty
+        if merge_overlaps and len(binary_masks) > 0:
+            num_before_merge = len(binary_masks)
+            binary_masks, scores, boxes = merge_overlapping_masks(
+                binary_masks, scores.cpu(), boxes.cpu(), iou_threshold=iou_threshold
+            )
+            if debug and img_id == image_ids[0]:
+                print(f"  Merged {num_before_merge} predictions -> {len(binary_masks)} (IoU threshold={iou_threshold})")
 
         # Encode masks to RLE (at native resolution - much faster!)
         if len(binary_masks) > 0:
@@ -714,11 +793,14 @@ class SAM3TrainerNative:
                     )
 
                     # Convert predictions to COCO format (at native 288×288 - fast!)
+                    # Enable overlapping segment merging to avoid over-segmentation penalty
                     coco_predictions = convert_predictions_to_coco_format(
                         all_predictions,
                         all_image_ids,
                         resolution=288,  # Native model output resolution
                         score_threshold=0.05,
+                        merge_overlaps=True,  # Merge overlapping predictions (matches test evaluation)
+                        iou_threshold=0.3,     # IoU threshold for merging
                         debug=False
                     )
 
