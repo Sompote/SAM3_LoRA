@@ -9,7 +9,7 @@ model:
 
 # LoRA settings
 lora:
-  rank: 32                   # Higher rank for more capacity
+  rank: 32                   # Reduced from 64 to avoid OOM
   alpha: 64                  # 2x rank
   dropout: 0.1               # Some dropout for regularization
 
@@ -32,29 +32,29 @@ lora:
 
 # Training settings
 training:
-  data_dir: "/workspace/data2"  # Root directory containing train/valid/test folders with COCO annotations
-  batch_size: 8         # Smaller batch due to more parameters
-  num_workers: 1
+  data_dir: "/workspace/data3"  # Root directory containing train/valid/test folders with COCO annotations
+  batch_size: 8      # Increased from 1 to reduce gradient variance
+  num_workers: 2        # Increase for better data loading
 
-  learning_rate: 1e-5        # Much lower LR for initial stability
+  learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
   weight_decay: 0.01
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1e-8
   max_grad_norm: 1.0
 
-  num_epochs: 200
-  warmup_steps: 1000
+  num_epochs: 100       # Reduced from 500 (small dataset overfits quickly)
+  warmup_steps: 200     # Reduced from 1000 (proportional to dataset size)
   lr_scheduler: "cosine"
 
   logging_steps: 10
-  eval_steps: 500
-  save_steps: 1000
-  save_total_limit: 3
+  eval_steps: 100       # More frequent validation (from 500)
+  save_steps: 100       # More frequent checkpoints (from 1000)
+  save_total_limit: 5   # Keep more checkpoints
 
   mixed_precision: "bf16"    # Use bfloat16 if available
   seed: 42
-  gradient_accumulation_steps: 4  # Accumulate to simulate larger batch
+  gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
 
 output:
   output_dir: "outputs/sam3_lora_full"

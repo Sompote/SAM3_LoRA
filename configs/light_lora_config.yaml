@@ -1,0 +1,73 @@
+# SAM3 LoRA Training Configuration - LIGHT VERSION
+# Lighter LoRA configuration for memory-constrained training
+# Use this for faster iteration and lower memory usage
+
+# Model settings
+model:
+  name: "facebook/sam3"
+  cache_dir: null
+
+# LoRA settings - REDUCED for memory efficiency
+lora:
+  rank: 16                   # Reduced from 32 (less capacity but faster)
+  alpha: 32                  # 2x rank
+  dropout: 0.1
+
+  # Target ONLY attention layers (skip MLP for memory savings)
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "out_proj"
+    # NOT including fc1/fc2 - saves memory
+
+  # Apply LoRA to FEWER components (memory optimization)
+  apply_to_vision_encoder: false   # Skip vision encoder (pre-trained features work well)
+  apply_to_text_encoder: true      # Keep text encoder (important for prompts)
+  apply_to_geometry_encoder: false # Skip geometry encoder
+  apply_to_detr_encoder: true      # Keep DETR encoder (core detection)
+  apply_to_detr_decoder: true      # Keep DETR decoder (core detection)
+  apply_to_mask_decoder: true      # Keep mask decoder (final segmentation)
+
+# Training settings
+training:
+  data_dir: "/workspace/data2"
+  batch_size: 2         # Larger than full config (fewer LoRA params)
+  num_workers: 2
+
+  learning_rate: 1e-4        # Higher LR for lighter model
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1e-8
+  max_grad_norm: 1.0
+
+  num_epochs: 100
+  warmup_steps: 200
+  lr_scheduler: "cosine"
+
+  logging_steps: 10
+  eval_steps: 100
+  save_steps: 100
+  save_total_limit: 5
+
+  mixed_precision: "bf16"
+  seed: 42
+  gradient_accumulation_steps: 8  # Effective batch = 2 × 8 = 16
+
+output:
+  output_dir: "outputs/sam3_lora_light"
+  logging_dir: "logs"
+  save_lora_only: true
+  push_to_hub: false
+  hub_model_id: null
+
+evaluation:
+  metric: "iou"
+  save_predictions: false
+  compute_metrics_during_training: true
+
+hardware:
+  device: "cuda"
+  dataloader_pin_memory: true
+  use_compile: false

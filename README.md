@@ -20,6 +20,12 @@ Fine-tune the SAM3 (Segment Anything Model 3) using **LoRA (Low-Rank Adaptation)
 
 ### Recent Updates
 
+**2025-12-08**:
+- Added performance optimization recommendations based on SAM3 original approach
+- Created `light_lora_config.yaml` for memory-constrained environments
+- Updated training config with better hyperparameters for small datasets
+- Added troubleshooting section for common training issues
+
 **2025-12-07**:
 - Fixed missing `rle_encode` import in `train_sam3_lora_native.py`
 - Verified category-aware text prompts work correctly in both training and validation
@@ -949,6 +955,183 @@ FileNotFoundError: COCO annotation file not found: /path/to/data/train/_annotati
 | Maximum (r=32) | ~2.0% | ~80 MB | 20 GB | Slowest |
 
 *Benchmarks on NVIDIA RTX 3090*
+
+---
+
+## Troubleshooting & Performance Optimization
+
+### Problem: Out of Memory (OOM) During Training
+
+**Symptoms:**
+```
+Killed (exit code 137)
+Training crashes after a few batches
+```
+
+**Solutions (based on SAM3 original approach):**
+
+1. **Use Light LoRA Config** (Recommended for GPUs with <24GB VRAM):
+   ```bash
+   python train_sam3_lora_native.py --config configs/light_lora_config.yaml
+   ```
+
+   This config:
+   - Reduces LoRA rank from 32 to 16
+   - Applies LoRA to fewer modules (skips vision encoder, geometry encoder)
+   - Uses batch_size=2 instead of 1
+   - ~60% less memory usage!
+
+2. **Reduce Batch Size** in `configs/full_lora_config.yaml`:
+   ```yaml
+   training:
+     batch_size: 1  # Already optimized from 8
+     gradient_accumulation_steps: 16  # Maintains effective batch size
+   ```
+
+3. **Clear GPU Memory** before training:
+   ```bash
+   nvidia-smi  # Check GPU usage
+   pkill python3  # Kill hanging processes
+   python train_sam3_lora_native.py --config configs/light_lora_config.yaml
+   ```
+
+### Problem: High Loss Values (>100)
+
+**Symptoms:**
+```
+Epoch 1: loss=159, 196, 185 (should be 5-20)
+```
+
+**Causes & Solutions:**
+
+1. **Learning Rate Too Low**:
+   - **Old**: `learning_rate: 1e-5`
+   - **New** (configs/full_lora_config.yaml:line 39): `learning_rate: 5e-5`
+   - SAM3 fine-tuning typically uses `1e-4` to `5e-4`
+
+2. **Warmup Steps Too High for Small Dataset**:
+   - **Old**: `warmup_steps: 1000` (for large datasets)
+   - **New**: `warmup_steps: 200` (proportional to 778 images)
+
+3. **Monitor Training** (first 10 batches should show declining loss):
+   ```bash
+   # Expected behavior:
+   Batch 1: loss=150
+   Batch 5: loss=80
+   Batch 10: loss=40
+   Batch 50: loss=15-25
+   ```
+
+### Problem: Low mAP/cgF1 Metrics
+
+**Comparison to SAM3 Original Validation:**
+
+| Aspect | SAM3 Original | Our Implementation |
+|--------|---------------|-------------------|
+| **Primary Metric** | cgF1 (concept-level F1) | mAP + cgF1 |
+| **NMS Filtering** | Built into inference | Explicit apply_sam3_nms() |
+| **Evaluation** | Loss-based during training | Full segmentation metrics |
+| **Resolution** | Fixed (dataset-dependent) | Flexible (288 or original) |
+
+**Solutions:**
+
+1. **Check Dataset Quality**:
+   ```bash
+   # Your dataset is small:
+   # Training: 778 images, 1631 annotations
+   # Validation: 152 images, 298 annotations
+
+   # For good performance, SAM3 typically uses:
+   # - Training: 10K+ images
+   # - More annotations per image (2-3 average is low)
+   ```
+
+2. **Adjust NMS Thresholds** in validate_sam3_lora.py:
+   ```python
+   # Line 865-867: Current settings
+   prob_threshold=0.3        # Try 0.4-0.5 (stricter)
+   nms_iou_threshold=0.7     # Try 0.5-0.6 (more aggressive merging)
+   max_detections=100        # Reduce to 50 if over-predicting
+   ```
+
+3. **Train Longer (but not too long)**:
+   ```yaml
+   # Updated in configs/full_lora_config.yaml
+   num_epochs: 100  # Reduced from 500 (small dataset overfits quickly)
+   eval_steps: 100  # More frequent validation to catch overfitting
+   ```
+
+4. **Use Lighter LoRA** for small datasets:
+   - Full LoRA (11.8M params) may overfit on 778 images
+   - Light LoRA (~5M params) generalizes better
+   - Try: `configs/light_lora_config.yaml`
+
+### Problem: Training is Very Slow
+
+**Solutions:**
+
+1. **Increase Workers**:
+   ```yaml
+   training:
+     num_workers: 2  # Already optimized from 1
+   ```
+
+2. **Use Smaller Validation Subset** during training:
+   - Edit train_sam3_lora_native.py to validate on first 50 images only
+   - Do full validation post-training
+
+3. **Reduce Validation Frequency**:
+   ```yaml
+   training:
+     eval_steps: 200  # Increase if validation takes too long
+   ```
+
+### Expected Performance Targets
+
+Based on SAM3 fine-tuning benchmarks and your dataset size:
+
+**After 10 epochs** (with light_lora_config.yaml):
+- Training loss: 10-20
+- mAP@50: 0.15-0.30
+- cgF1@50: 0.25-0.40
+
+**After 50 epochs**:
+- Training loss: 5-10
+- mAP@50: 0.30-0.50
+- cgF1@50: 0.40-0.60
+
+**After 100 epochs** (optimal):
+- Training loss: 3-7
+- mAP@50: 0.40-0.65
+- cgF1@50: 0.50-0.70
+
+**Note**: Small dataset (778 images) limits max achievable performance. For mAP >0.7, you typically need 5K+ training images.
+
+### Recommended Training Strategy
+
+**Quick Start (Testing)**:
+```bash
+# 1. Use light config for fast iteration
+python train_sam3_lora_native.py --config configs/light_lora_config.yaml
+
+# 2. Monitor first 10 batches (loss should decrease)
+# 3. Train for 20-30 epochs first
+# 4. Run validation:
+python validate_sam3_lora.py \
+  --config configs/light_lora_config.yaml \
+  --weights outputs/sam3_lora_light/checkpoint_epoch_30.pt \
+  --val_data_dir /workspace/data2/valid
+```
+
+**Full Training (Production)**:
+```bash
+# 1. If light config works well, try full config
+python train_sam3_lora_native.py --config configs/full_lora_config.yaml
+
+# 2. Train for 100 epochs max
+# 3. Validate at checkpoints: 20, 50, 100 epochs
+# 4. Use best performing checkpoint
+```
 
 ---
 

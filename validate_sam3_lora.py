@@ -229,6 +229,77 @@ class COCOSegmentDataset(Dataset):
         )
 
 
+def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.15):
+    """
+    Merge overlapping masks that likely represent the same object (e.g., crack segments).
+
+    This is more aggressive than NMS - it MERGES masks instead of suppressing them.
+    Useful for cracks where model splits one crack into many segments.
+
+    Args:
+        binary_masks: Binary masks [N, H, W]
+        scores: Confidence scores [N]
+        boxes: Bounding boxes [N, 4]
+        iou_threshold: IoU threshold for merging (default: 0.15, lower = more aggressive)
+
+    Returns:
+        Tuple of (merged_masks, merged_scores, merged_boxes)
+    """
+    if len(binary_masks) == 0:
+        return binary_masks, scores, boxes
+
+    # Sort by score (highest first)
+    sorted_indices = torch.argsort(scores, descending=True)
+    binary_masks = binary_masks[sorted_indices]
+    scores = scores[sorted_indices]
+    boxes = boxes[sorted_indices]
+
+    merged_masks = []
+    merged_scores = []
+    merged_boxes = []
+    used = torch.zeros(len(binary_masks), dtype=torch.bool)
+
+    for i in range(len(binary_masks)):
+        if used[i]:
+            continue
+
+        current_mask = binary_masks[i].clone()
+        current_score = scores[i].item()
+        current_box = boxes[i]
+        used[i] = True
+
+        # Find overlapping masks and merge them
+        for j in range(i + 1, len(binary_masks)):
+            if used[j]:
+                continue
+
+            # Compute IoU
+            intersection = (current_mask & binary_masks[j]).sum().item()
+            union = (current_mask | binary_masks[j]).sum().item()
+            iou = intersection / union if union > 0 else 0
+
+            # If overlaps significantly, merge it
+            if iou > iou_threshold:
+                current_mask = current_mask | binary_masks[j]
+                current_score = max(current_score, scores[j].item())
+                used[j] = True
+
+        merged_masks.append(current_mask)
+        merged_scores.append(current_score)
+        merged_boxes.append(current_box)
+
+    if len(merged_masks) > 0:
+        merged_masks = torch.stack(merged_masks)
+        merged_scores = torch.tensor(merged_scores, device=scores.device)
+        merged_boxes = torch.stack(merged_boxes)
+    else:
+        merged_masks = binary_masks[:0]
+        merged_scores = scores[:0]
+        merged_boxes = boxes[:0]
+
+    return merged_masks, merged_scores, merged_boxes
+
+
 def apply_sam3_nms(pred_logits, pred_masks, pred_boxes, prob_threshold=0.3, nms_iou_threshold=0.7, max_detections=100):
     """
     Apply SAM3's standard NMS pipeline to filter predictions.
@@ -280,7 +351,8 @@ def apply_sam3_nms(pred_logits, pred_masks, pred_boxes, prob_threshold=0.3, nms_
 
 
 def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=288,
-                                       prob_threshold=0.3, nms_iou_threshold=0.7, max_detections=100):
+                                       prob_threshold=0.3, nms_iou_threshold=0.7, max_detections=100,
+                                       merge_cracks=False, merge_iou_threshold=0.15):
     """
     Convert model predictions to COCO format using SAM3's NMS pipeline.
 
@@ -291,12 +363,19 @@ def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=2
         prob_threshold: Score threshold (default: 0.3, SAM3 uses 0.5)
         nms_iou_threshold: NMS IoU threshold (default: 0.7)
         max_detections: Max detections per image (default: 100)
+        merge_cracks: If True, merge overlapping segments instead of NMS suppression (default: False)
+        merge_iou_threshold: IoU threshold for merging (default: 0.15, lower = more aggressive)
     """
     coco_predictions = []
     pred_id = 0
 
-    print(f"\n[INFO] Converting {len(predictions_list)} predictions to COCO format...")
-    print(f"[INFO] Using SAM3 NMS: prob_threshold={prob_threshold}, nms_iou={nms_iou_threshold}, max_dets={max_detections}")
+    if merge_cracks:
+        print(f"\n[INFO] Converting {len(predictions_list)} predictions to COCO format...")
+        print(f"[INFO] Using CRACK MERGING mode: prob_threshold={prob_threshold}, merge_iou={merge_iou_threshold}, max_dets={max_detections}")
+        print(f"[INFO] This will MERGE overlapping crack segments instead of suppressing them")
+    else:
+        print(f"\n[INFO] Converting {len(predictions_list)} predictions to COCO format...")
+        print(f"[INFO] Using SAM3 NMS: prob_threshold={prob_threshold}, nms_iou={nms_iou_threshold}, max_dets={max_detections}")
 
     for img_id, preds in tqdm(zip(image_ids, predictions_list), total=len(predictions_list), desc="Converting predictions"):
         if preds is None or len(preds.get('pred_logits', [])) == 0:
@@ -306,15 +385,53 @@ def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=2
         boxes = preds['pred_boxes']    # [N, 4]
         masks = preds['pred_masks']    # [N, H, W]
 
-        # Apply SAM3's NMS pipeline
-        filtered_masks, filtered_scores, filtered_boxes = apply_sam3_nms(
-            pred_logits=logits,
-            pred_masks=masks,
-            pred_boxes=boxes,
-            prob_threshold=prob_threshold,
-            nms_iou_threshold=nms_iou_threshold,
-            max_detections=max_detections
-        )
+        if merge_cracks:
+            # Step 1: Filter by score threshold
+            pred_probs = torch.sigmoid(logits).squeeze(-1)  # [N]
+            valid_mask = pred_probs > prob_threshold
+
+            filtered_masks = masks[valid_mask]
+            filtered_scores = pred_probs[valid_mask]
+            filtered_boxes = boxes[valid_mask]
+
+            if len(filtered_masks) > 0:
+                # Step 2: Convert masks to binary
+                pred_masks_sigmoid = torch.sigmoid(filtered_masks)
+                pred_masks_binary = (pred_masks_sigmoid > 0.5)
+
+                # Step 3: MERGE overlapping crack segments
+                merged_masks, merged_scores, merged_boxes = merge_overlapping_masks(
+                    pred_masks_binary.cpu(),
+                    filtered_scores.cpu(),
+                    filtered_boxes.cpu(),
+                    iou_threshold=merge_iou_threshold
+                )
+
+                # Step 4: Top-K selection by score
+                if max_detections > 0 and len(merged_scores) > max_detections:
+                    top_k_scores, top_k_indices = torch.topk(merged_scores, k=max_detections, largest=True)
+                    merged_masks = merged_masks[top_k_indices]
+                    merged_scores = top_k_scores
+                    merged_boxes = merged_boxes[top_k_indices]
+
+                # Return merged results (already binary)
+                filtered_masks = merged_masks.float()  # Already binary, just convert to float
+                filtered_scores = merged_scores
+                filtered_boxes = merged_boxes
+            else:
+                filtered_masks = torch.tensor([])
+                filtered_scores = torch.tensor([])
+                filtered_boxes = torch.tensor([])
+        else:
+            # Apply SAM3's NMS pipeline (standard suppression)
+            filtered_masks, filtered_scores, filtered_boxes = apply_sam3_nms(
+                pred_logits=logits,
+                pred_masks=masks,
+                pred_boxes=boxes,
+                prob_threshold=prob_threshold,
+                nms_iou_threshold=nms_iou_threshold,
+                max_detections=max_detections
+            )
 
         if len(filtered_masks) > 0:
             # Convert filtered masks to binary for RLE encoding
@@ -650,7 +767,8 @@ def move_to_device(obj, device):
     return obj
 
 
-def validate(config_path, weights_path, val_data_dir, num_samples=None):
+def validate(config_path, weights_path, val_data_dir, num_samples=None,
+             prob_threshold=0.3, nms_iou=0.7, merge_cracks=False, merge_iou=0.15):
     """Run validation with full metrics (mAP, cgF1) and SAM3 NMS
 
     Args:
@@ -855,19 +973,22 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None):
     # if all_scores:
     #     print(f"[INFO] Prediction scores: min={min(all_scores):.4f}, max={max(all_scores):.4f}, mean={np.mean(all_scores):.4f}")
 
-    # Convert predictions using SAM3's NMS pipeline
-    # Default SAM3 settings: prob_threshold=0.5, nms_iou=0.7, max_dets=100
-    # Using slightly lower threshold (0.3) since model is still training
+    # Convert predictions using SAM3's NMS pipeline or crack merging
     coco_predictions = convert_predictions_to_coco_format(
         all_predictions,
         all_image_ids,
         resolution=288,
-        prob_threshold=0.3,        # SAM3 default: 0.5
-        nms_iou_threshold=0.7,     # SAM3 default: 0.5-0.7
-        max_detections=100         # Limit top-100 per image
+        prob_threshold=prob_threshold,
+        nms_iou_threshold=nms_iou,
+        max_detections=100,
+        merge_cracks=merge_cracks,
+        merge_iou_threshold=merge_iou
     )
 
-    print(f"\n[INFO] Total predictions after SAM3 NMS filtering: {len(coco_predictions)}")
+    if merge_cracks:
+        print(f"\n[INFO] Total predictions after CRACK MERGING: {len(coco_predictions)}")
+    else:
+        print(f"\n[INFO] Total predictions after SAM3 NMS filtering: {len(coco_predictions)}")
 
     if len(coco_predictions) > 0:
         # Save temporary files for COCO evaluation
@@ -972,11 +1093,38 @@ if __name__ == "__main__":
         default=None,
         help="Limit validation to N samples (for debugging)"
     )
+    parser.add_argument(
+        "--prob-threshold",
+        type=float,
+        default=0.3,
+        help="Probability threshold for filtering predictions (default: 0.3)"
+    )
+    parser.add_argument(
+        "--nms-iou",
+        type=float,
+        default=0.7,
+        help="NMS IoU threshold (default: 0.7)"
+    )
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help="Enable aggressive merging of overlapping segments (recommended for crack detection)"
+    )
+    parser.add_argument(
+        "--merge-iou",
+        type=float,
+        default=0.15,
+        help="IoU threshold for merging overlapping predictions (default: 0.15, lower = more aggressive)"
+    )
     args = parser.parse_args()
 
     validate(
         config_path=args.config,
         weights_path=args.weights,
         val_data_dir=args.val_data_dir,
-        num_samples=args.num_samples
+        num_samples=args.num_samples,
+        prob_threshold=args.prob_threshold,
+        nms_iou=args.nms_iou,
+        merge_cracks=args.merge,
+        merge_iou=args.merge_iou
     )
