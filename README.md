@@ -236,19 +236,19 @@ Loaded COCO dataset: valid split
   Images: 152
   Annotations: 298
 Found validation data: 152 images
-Starting training for 200 epochs...
+Starting training for 100 epochs...
 Training samples: 778, Validation samples: 152
 
 Epoch 1: 100%|████████| 98/98 [07:47<00:00, loss=140]
 Validation: 100%|████████| 19/19 [00:32<00:00, val_loss=23.7]
 
-Epoch 1/200 - Train Loss: 156.234567, Val Loss: 17.032280
+Epoch 1/100 - Train Loss: 156.234567, Val Loss: 17.032280
 ✓ New best model saved (val_loss: 17.032280)
 
 Epoch 2: 100%|████████| 98/98 [07:24<00:00, loss=167]
 Validation: 100%|████████| 19/19 [00:31<00:00, val_loss=20.1]
 
-Epoch 2/200 - Train Loss: 142.891234, Val Loss: 15.641912
+Epoch 2/100 - Train Loss: 142.891234, Val Loss: 15.641912
 ✓ New best model saved (val_loss: 15.641912)
 ...
 ```
@@ -319,18 +319,19 @@ lora:
 training:
   data_dir: "/path/to/data"   # Root directory with train/valid/test folders
   batch_size: 8               # Adjust based on GPU memory
-  num_epochs: 200             # Training epochs
-  learning_rate: 1e-5         # Learning rate (lower for stability)
+  num_epochs: 100             # Training epochs
+  learning_rate: 5e-5         # Learning rate (5e-5 recommended for SAM3 fine-tuning)
   weight_decay: 0.01          # Weight decay
+  gradient_accumulation_steps: 8  # Effective batch = batch_size × accumulation
 
 output:
   output_dir: "outputs/my_model"
 ```
 
 **Important Notes:**
-- Use **generic text prompts** like `"object"` for best results (SAM models work better with simple terms)
-- The dataset automatically extracts category names from COCO annotations
-- Text prompts during training are class-agnostic to leverage pre-trained knowledge
+- **Category-aware prompts**: The training automatically uses category names as text prompts (e.g., "crack", "joint") extracted from COCO annotations
+- Each training image is prompted with its specific object categories (in lowercase)
+- This approach improves performance by using task-specific vocabulary while leveraging SAM3's pre-trained text understanding
 
 Then train:
 ```bash
@@ -1138,9 +1139,11 @@ Training crashes after a few batches
 2. **Reduce Batch Size** in `configs/full_lora_config.yaml`:
    ```yaml
    training:
-     batch_size: 1  # Already optimized from 8
-     gradient_accumulation_steps: 16  # Maintains effective batch size
+     batch_size: 2  # Current optimized value (was 8, then 1)
+     gradient_accumulation_steps: 8  # Maintains effective batch size of 16
    ```
+
+   **Note**: `batch_size=2` is better than `batch_size=1` because it reduces gradient variance and leads to more stable training.
 
 3. **Clear GPU Memory** before training:
    ```bash
@@ -1149,32 +1152,37 @@ Training crashes after a few batches
    python train_sam3_lora_native.py --config configs/light_lora_config.yaml
    ```
 
-### Problem: High Loss Values (>100)
+### Understanding SAM3 Loss Values
 
-**Symptoms:**
+**Loss values of 110-159 are NORMAL for SAM3!** ✅
+
+SAM3 uses **weighted multi-component loss** following the original implementation:
+- `loss_mask`: 200.0 (dominant component)
+- `loss_ce`: 20.0 (classification)
+- `loss_dice`: 10.0 (dice coefficient)
+- `loss_bbox`: 5.0 (bounding box)
+- `loss_giou`: 2.0 (generalized IoU)
+- `presence_loss`: 20.0 (object presence)
+
+**Example calculation:**
+```python
+# Typical unweighted losses at start:
+loss_mask: 0.5 × 200 = 100
+loss_ce: 0.5 × 20 = 10
+loss_dice: 0.5 × 10 = 5
+# ... others contribute ~15
+Total: ~130 (NORMAL!)
 ```
-Epoch 1: loss=159, 196, 185 (should be 5-20)
-```
 
-**Causes & Solutions:**
+**What to monitor:**
+- ✅ **Trending downward**: Loss 150 → 120 → 100 → 80 (good!)
+- ❌ **Erratic jumps**: Loss 150 → 100 → 200 → 90 (batch_size too small, see fixes below)
+- ❌ **Stuck**: Loss stays at 150 for many epochs (learning rate too low)
 
-1. **Learning Rate Too Low**:
-   - **Old**: `learning_rate: 1e-5`
-   - **New** (configs/full_lora_config.yaml:line 39): `learning_rate: 5e-5`
-   - SAM3 fine-tuning typically uses `1e-4` to `5e-4`
-
-2. **Warmup Steps Too High for Small Dataset**:
-   - **Old**: `warmup_steps: 1000` (for large datasets)
-   - **New**: `warmup_steps: 200` (proportional to 778 images)
-
-3. **Monitor Training** (first 10 batches should show declining loss):
-   ```bash
-   # Expected behavior:
-   Batch 1: loss=150
-   Batch 5: loss=80
-   Batch 10: loss=40
-   Batch 50: loss=15-25
-   ```
+**If loss is highly fluctuating** (e.g., 169 → 141 → 242 → 182):
+1. **Increase batch_size** from 1 to 2 (reduces gradient variance)
+2. **Check data_dir** in config points to correct location
+3. **Reduce LoRA rank** if getting OOM errors (64 → 32)
 
 ### Problem: Low mAP/cgF1 Metrics
 
