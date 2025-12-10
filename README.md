@@ -817,6 +817,58 @@ python3 infer_sam.py \
 
 ---
 
+## Test Results: Road Damage Detection
+
+We evaluated the fine-tuned SAM3-LoRA model on pothole detection, comparing it against the base SAM3 model without fine-tuning.
+
+### Validation Metrics Comparison
+
+<div align="center">
+<img src="asset/Screenshot 2568-12-10 at 08.20.20.png" alt="Validation Metrics" width="800">
+<br>
+<em>Validation performance: LoRA fine-tuned model vs Base SAM3 model</em>
+</div>
+
+<br>
+
+**Key Findings:**
+- **LoRA Model (Fine-tuned)**: Shows improved precision and better detection of multiple potholes
+- **Base Model**: Tends to produce more false positives and misses some instances
+- **Dataset**: Pothole detection on road surfaces (data3)
+
+### Visual Comparison
+
+<div align="center">
+<img src="asset/combined_comparison_all.jpg" alt="Visual Comparison" width="900">
+<br>
+<em>Side-by-side comparison: Ground Truth (Green) | LoRA Model (Red) | Base Model (Blue)</em>
+</div>
+
+<br>
+
+**Observations from Visual Results:**
+
+| Image | Ground Truth | LoRA Model | Base Model | Analysis |
+|-------|--------------|------------|------------|----------|
+| **img_0034** | 1 pothole | 1 detection ✓ | 5 detections ✗ | LoRA matches GT perfectly, Base has 4 false positives |
+| **img_0001** | 1 pothole | 1 detection ✓ | 1 detection ✓ | Both models perform well |
+| **img_0080** | 1 pothole | 2 detections ~ | 2 detections ~ | Both have 1 false positive |
+| **img_0070** | 1 pothole | 1 detection ✓ | 1 detection ✓ | Both models perform well |
+| **img_0060** | 4 potholes | 4 detections ✓ | 2 detections ✗ | LoRA finds all instances, Base misses 2 |
+
+**Summary:**
+- **LoRA Model**: 3/5 perfect matches, better recall on multi-instance images
+- **Base Model**: 2/5 perfect matches, struggles with multiple instances and false positives
+- **Overall**: Fine-tuning with LoRA significantly improves detection accuracy for domain-specific tasks
+
+**Training Details:**
+- **Prompt**: "pothole" (auto-detected from COCO category names)
+- **Architecture**: Full LoRA adaptation (vision, text, DETR encoders/decoders)
+- **Dataset**: Road damage images with COCO-format annotations
+- **Threshold**: 0.5 confidence for both models
+
+---
+
 ## Examples
 
 ### Example 1: Quick Test (5 Epochs)
