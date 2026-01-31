@@ -20,6 +20,11 @@ Fine-tune the SAM3 (Segment Anything Model 3) using **LoRA (Low-Rank Adaptation)
 
 ### Recent Updates
 
+**2026-01-31**:
+- **Replaced `--no-boxes` with `--boundingbox` option** in `infer_sam.py`
+- New `--boundingbox True/False` flag for explicit bounding box control (default: False)
+- Updated README documentation and inference examples
+
 **2026-01-04**:
 - **Added Multi-GPU training support** using DistributedDataParallel (DDP)
 - New `--device` argument for easy GPU selection: `--device 0 1 2 3`
