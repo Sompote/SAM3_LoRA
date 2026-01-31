@@ -126,7 +126,7 @@ cd SAM3_LoRA
 pip install -e .
 
 # Login to Hugging Face
-huggingface-cli login
+hf auth login
 # Paste your token when prompted
 ```
 
