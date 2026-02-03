@@ -150,35 +150,57 @@ class SAM3DatasetWithCategories(Dataset):
             size=(self.resolution, self.resolution)
         )
 
-        # Determine which category to use as text prompt
-        # Strategy: use the most common category in this image
-        if category_ids:
-            most_common_cat_id = max(set(category_ids), key=category_ids.count)
-            query_text = self.categories.get(most_common_cat_id, "object")
+        # Construct Queries - one per unique category
+        # Each query maps to only the objects of that category
+        from collections import defaultdict
+
+        # Group object IDs by their category
+        cat_id_to_object_ids = defaultdict(list)
+        for obj, cat_id in zip(objects, category_ids):
+            cat_id_to_object_ids[cat_id].append(obj.object_id)
+
+        # Create one query per category
+        queries = []
+        if len(cat_id_to_object_ids) > 0:
+            for cat_id, obj_ids in cat_id_to_object_ids.items():
+                query_text = self.categories.get(cat_id, "object")
+                query = FindQueryLoaded(
+                    query_text=query_text,
+                    image_id=0,
+                    object_ids_output=obj_ids,
+                    is_exhaustive=True,
+                    query_processing_order=0,
+                    inference_metadata=InferenceMetadata(
+                        coco_image_id=idx,
+                        original_image_id=idx,
+                        original_category_id=cat_id,
+                        original_size=(orig_h, orig_w),
+                        object_id=-1,
+                        frame_index=-1
+                    )
+                )
+                queries.append(query)
         else:
-            query_text = "object"
-
-        # Construct Query with ACTUAL category name
-        object_ids = [obj.object_id for obj in objects]
-
-        query = FindQueryLoaded(
-            query_text=query_text,  # ✅ Uses actual category name!
-            image_id=0,
-            object_ids_output=object_ids,
-            is_exhaustive=True,
-            query_processing_order=0,
-            inference_metadata=InferenceMetadata(
-                coco_image_id=idx,
-                original_image_id=idx,
-                original_category_id=most_common_cat_id if category_ids else 0,
-                original_size=(orig_h, orig_w),
-                object_id=-1,
-                frame_index=-1
+            # No annotations: create a single generic query
+            query = FindQueryLoaded(
+                query_text="object",
+                image_id=0,
+                object_ids_output=[],
+                is_exhaustive=True,
+                query_processing_order=0,
+                inference_metadata=InferenceMetadata(
+                    coco_image_id=idx,
+                    original_image_id=idx,
+                    original_category_id=0,
+                    original_size=(orig_h, orig_w),
+                    object_id=-1,
+                    frame_index=-1
+                )
             )
-        )
+            queries.append(query)
 
         return Datapoint(
-            find_queries=[query],
+            find_queries=queries,
             images=[image_obj],
             raw_images=[pil_image]
         )

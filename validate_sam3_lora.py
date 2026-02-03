@@ -186,44 +186,56 @@ class COCOSegmentDataset(Dataset):
             size=(self.resolution, self.resolution)
         )
 
-        # Construct Query
-        # Use category names from COCO annotations for category-aware validation
-        object_ids = [obj.object_id for obj in objects]
+        # Construct Queries - one per unique category
+        # Each query maps to only the objects of that category
+        from collections import defaultdict
 
-        # Determine query text based on categories present in the image
-        if len(object_class_names) > 0:
-            unique_classes = list(set(object_class_names))
-            if len(unique_classes) == 1:
-                # Single category: use its name (lowercase)
-                query_text = unique_classes[0].lower()
-            else:
-                # Multiple categories: use most common one
-                # This helps the model learn category-specific features
-                from collections import Counter
-                most_common = Counter(object_class_names).most_common(1)[0][0]
-                query_text = most_common.lower()
+        # Group object IDs by their class name
+        class_to_object_ids = defaultdict(list)
+        for obj, class_name in zip(objects, object_class_names):
+            class_to_object_ids[class_name.lower()].append(obj.object_id)
+
+        # Create one query per category
+        queries = []
+        if len(class_to_object_ids) > 0:
+            for query_text, obj_ids in class_to_object_ids.items():
+                query = FindQueryLoaded(
+                    query_text=query_text,
+                    image_id=0,
+                    object_ids_output=obj_ids,
+                    is_exhaustive=True,
+                    query_processing_order=0,
+                    inference_metadata=InferenceMetadata(
+                        coco_image_id=img_id,
+                        original_image_id=img_id,
+                        original_category_id=0,
+                        original_size=(orig_h, orig_w),
+                        object_id=-1,
+                        frame_index=-1
+                    )
+                )
+                queries.append(query)
         else:
-            # No annotations: use generic term
-            query_text = "object"
-
-        query = FindQueryLoaded(
-            query_text=query_text,
-            image_id=0,
-            object_ids_output=object_ids,
-            is_exhaustive=True,
-            query_processing_order=0,
-            inference_metadata=InferenceMetadata(
-                coco_image_id=img_id,
-                original_image_id=img_id,
-                original_category_id=0,
-                original_size=(orig_h, orig_w),
-                object_id=-1,
-                frame_index=-1
+            # No annotations: create a single generic query
+            query = FindQueryLoaded(
+                query_text="object",
+                image_id=0,
+                object_ids_output=[],
+                is_exhaustive=True,
+                query_processing_order=0,
+                inference_metadata=InferenceMetadata(
+                    coco_image_id=img_id,
+                    original_image_id=img_id,
+                    original_category_id=0,
+                    original_size=(orig_h, orig_w),
+                    object_id=-1,
+                    frame_index=-1
+                )
             )
-        )
+            queries.append(query)
 
         return Datapoint(
-            find_queries=[query],
+            find_queries=queries,
             images=[image_obj],
             raw_images=[pil_image]
         )
