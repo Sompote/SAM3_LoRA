@@ -543,6 +543,104 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
     return coco_gt
 
 
+def create_coco_gt_per_prompt(dataset, eval_units, mask_resolution=288):
+    """
+    Create COCO ground truth where each evaluation unit is a single
+    (image, text-prompt) pair rather than a whole image.
+
+    This is the correct GT for SAM3 validation: the model produces one set of
+    predictions per text prompt, and an image may carry several prompts (one per
+    category). Each unit's GT therefore contains ONLY the objects that the
+    prompt targets, so a prediction for "crack" is never scored against "hole"
+    boxes. Empty/negative prompts produce a GT image with no annotations.
+
+    Args:
+        dataset: the validation dataset.
+        eval_units: list of dicts, each with
+            - 'eval_id': unique COCO image id for this (image, prompt) pair
+            - 'src_idx': index into `dataset` of the source image
+            - 'obj_ids': object ids (into datapoint.images[0].objects) that this
+                         prompt is responsible for (empty list for negatives)
+        mask_resolution: resolution GT masks/boxes are scaled to (matches preds).
+    """
+    print(f"\n[INFO] Creating per-prompt COCO ground truth "
+          f"(downsampling to {mask_resolution}×{mask_resolution})...")
+
+    coco_gt = {
+        'info': {
+            'description': 'SAM3 LoRA Validation Dataset (per-prompt)',
+            'version': '1.0',
+            'year': 2024
+        },
+        'images': [],
+        'annotations': [],
+        'categories': [{'id': 1, 'name': 'object'}]
+    }
+
+    ann_id = 0
+    # Cache decoded datapoints so we read/decode each source image only once
+    # even when it contributes several prompts.
+    datapoint_cache = {}
+
+    for unit in tqdm(eval_units, desc="Creating GT"):
+        eval_id = int(unit['eval_id'])
+        src_idx = int(unit['src_idx'])
+        obj_ids = set(int(o) for o in unit['obj_ids'])
+
+        coco_gt['images'].append({
+            'id': eval_id,
+            'width': mask_resolution,
+            'height': mask_resolution,
+            'is_instance_exhaustive': True
+        })
+
+        if src_idx not in datapoint_cache:
+            datapoint_cache[src_idx] = dataset[src_idx]
+        datapoint = datapoint_cache[src_idx]
+
+        for obj in datapoint.images[0].objects:
+            # Only the objects this prompt is responsible for.
+            if obj.object_id not in obj_ids:
+                continue
+
+            # Scale boxes to mask_resolution (bboxes are normalized 0..1)
+            box = obj.bbox * mask_resolution
+            x1, y1, x2, y2 = box.tolist()
+            x, y, w, h = x1, y1, x2 - x1, y2 - y1
+
+            ann = {
+                'id': ann_id,
+                'image_id': eval_id,
+                'category_id': 1,
+                'bbox': [x, y, w, h],
+                'area': w * h,
+                'iscrowd': 0,
+                'ignore': 0
+            }
+
+            if obj.segment is not None:
+                mask_tensor = obj.segment.unsqueeze(0).unsqueeze(0).float()
+                downsampled_mask = torch.nn.functional.interpolate(
+                    mask_tensor,
+                    size=(mask_resolution, mask_resolution),
+                    mode='bilinear',
+                    align_corners=False
+                ) > 0.5
+
+                mask_np = downsampled_mask.squeeze().cpu().numpy().astype(np.uint8)
+                rle = mask_utils.encode(np.asfortranarray(mask_np))
+                rle['counts'] = rle['counts'].decode('utf-8')
+                ann['segmentation'] = rle
+
+            coco_gt['annotations'].append(ann)
+            ann_id += 1
+
+    print(f"[INFO] Created {len(coco_gt['images'])} prompt units, "
+          f"{len(coco_gt['annotations'])} annotations")
+
+    return coco_gt
+
+
 def convert_predictions_to_coco_format_original_res(predictions_list, image_ids, dataset, model_resolution=288, score_threshold=0.0, merge_overlaps=True, iou_threshold=0.3, debug=False):
     """
     Convert model predictions to COCO format at ORIGINAL image resolution.
@@ -945,7 +1043,8 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     print("="*80)
 
     all_predictions = []
-    all_image_ids = []
+    all_image_ids = []      # one unique eval id per (image, prompt) pair
+    all_eval_units = []     # parallel: {eval_id, src_idx, obj_ids} for GT building
     val_losses = []
 
     # Use automatic mixed precision for faster inference
@@ -973,11 +1072,36 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
                 final_stage = list(outputs_iter)[-1]
                 final_outputs = final_stage[-1]
 
-                batch_size_actual = final_outputs['pred_logits'].shape[0]
+                # NOTE: the leading dim of pred_logits is the number of TEXT
+                # PROMPTS (find-queries) in the batch, NOT the number of images.
+                # An image with N categories contributes N prompts here. The old
+                # code assumed one prompt per image (img_id = batch_idx*batch_size
+                # + i), which both ran past len(dataset) and mis-assigned
+                # predictions on multi-category data. Instead we read each
+                # prompt's true source image and target objects from the batch
+                # metadata/targets (same flattened order as the model output) and
+                # treat every (image, prompt) pair as its own evaluation unit.
+                num_prompts = final_outputs['pred_logits'].shape[0]
 
-                for i in range(batch_size_actual):
-                    img_id = batch_idx * batch_size + i
-                    all_image_ids.append(img_id)
+                # query_processing_order=0 -> stage 0 for the image model
+                meta = input_batch.find_metadatas[0]
+                tgt = input_batch.find_targets[0]
+                src_img_ids = meta.original_image_id      # per-prompt source idx
+                num_boxes = tgt.num_boxes                 # per-prompt object count
+                obj_ids_padded = tgt.object_ids_padded    # per-prompt object ids (-1 padded)
+
+                for i in range(num_prompts):
+                    eval_id = len(all_predictions)        # unique, sequential
+                    src_idx = int(src_img_ids[i])
+                    n = int(num_boxes[i])
+                    obj_ids = [int(o) for o in obj_ids_padded[i][:n].tolist()] if n > 0 else []
+
+                    all_image_ids.append(eval_id)
+                    all_eval_units.append({
+                        'eval_id': eval_id,
+                        'src_idx': src_idx,
+                        'obj_ids': obj_ids,
+                    })
                     all_predictions.append({
                         'pred_logits': final_outputs['pred_logits'][i].detach().cpu(),
                         'pred_boxes': final_outputs['pred_boxes'][i].detach().cpu(),
@@ -991,11 +1115,12 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     print("COMPUTING METRICS")
     print("="*80)
 
-    # Create COCO ground truth (downsampled to 288×288 - fast!)
-    print(f"\n[INFO] Creating ground truth from validation dataset...")
-    coco_gt_dict = create_coco_gt_from_dataset(
+    # Create COCO ground truth, one unit per (image, prompt) pair so multi-
+    # category images are scored correctly (downsampled to 288×288 - fast!)
+    print(f"\n[INFO] Creating per-prompt ground truth from validation dataset...")
+    coco_gt_dict = create_coco_gt_per_prompt(
         val_ds,
-        image_ids=all_image_ids,
+        all_eval_units,
         mask_resolution=288
     )
 
