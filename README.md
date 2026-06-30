@@ -519,6 +519,26 @@ Category-agnostic F1 Scores:
 ================================================================================
 ```
 
+### Multi-class validation
+
+The validator fully supports datasets with **multiple categories per image**. SAM3
+is prompt-based: for each image it issues one text prompt per category, and the
+model returns a separate set of predictions for every prompt. The validator
+treats each `(image, prompt)` pair as its own evaluation unit and scores each
+prompt **only against the ground-truth objects of that category** — so a `crack`
+prediction is never matched against `hole` boxes, and prompts that should find
+nothing are evaluated as empty units.
+
+No extra flags are needed — multi-class COCO files (multiple entries under
+`categories`) are handled automatically. The category names in your
+`_annotations.coco.json` are used verbatim as the text prompts, so make sure
+they read like natural concepts (e.g. `"deep crack"`, not `"class_2"`).
+
+> **Note:** earlier versions assumed a single prompt per image and would raise an
+> index-out-of-range error in `create_coco_gt_from_dataset` on multi-category
+> datasets (the prediction batch dimension is the number of *prompts*, not
+> images). This is fixed — `git pull` if you hit that error.
+
 ### Validation Metrics Explained
 
 | Metric | Description | Good Value | Excellent Value |
