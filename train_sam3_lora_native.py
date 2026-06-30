@@ -25,6 +25,7 @@ import os
 import argparse
 import yaml
 import json
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -109,15 +110,34 @@ def print_rank0(*args, **kwargs):
 
 class COCOSegmentDataset(Dataset):
     """Dataset class for COCO format segmentation data"""
-    def __init__(self, data_dir, split="train"):
+
+    # Generic out-of-domain concepts used as additional hard negatives, so the
+    # model learns to NOT fire on unrelated prompts (e.g. 'car' on a crack set).
+    DEFAULT_GENERIC_NEGATIVES = [
+        "car", "person", "dog", "cat", "tree", "building", "sky", "road",
+        "chair", "table", "bottle", "phone", "bicycle", "bird", "flower",
+        "water", "grass", "cloud", "window", "door",
+    ]
+
+    def __init__(self, data_dir, split="train", num_negatives=2,
+                 generic_negatives=None):
         """
         Args:
             data_dir: Root directory containing train/valid/test folders
             split: One of 'train', 'valid', 'test'
+            num_negatives: Hard-negative text queries to add per image. These are
+                prompts that must return ZERO detections. Without them the model
+                is trained on positives only and learns to fire on every prompt.
+            generic_negatives: Optional list of out-of-domain negative concepts.
         """
         self.data_dir = Path(data_dir)
         self.split = split
         self.split_dir = self.data_dir / split
+        self.num_negatives = num_negatives
+        self.generic_negatives = list(
+            generic_negatives if generic_negatives is not None
+            else self.DEFAULT_GENERIC_NEGATIVES
+        )
 
         # Load COCO annotations
         ann_file = self.split_dir / "_annotations.coco.json"
@@ -301,6 +321,33 @@ class COCOSegmentDataset(Dataset):
                 )
             )
             queries.append(query)
+
+        # --- Hard-negative text queries ---------------------------------
+        # Prompts that should return NOTHING for this image. This supplies the
+        # negative supervision missing from positive-only training and prevents
+        # the model from firing on every prompt after fine-tuning.
+        present_names = {name.lower() for name in class_to_object_ids.keys()}
+        neg_pool = [c.lower() for c in self.categories.values()] + \
+                   [n.lower() for n in self.generic_negatives]
+        absent_names = sorted({n for n in neg_pool if n not in present_names})
+        if self.num_negatives > 0 and len(absent_names) > 0:
+            num_neg = min(self.num_negatives, len(absent_names))
+            for neg_name in random.sample(absent_names, num_neg):
+                queries.append(FindQueryLoaded(
+                    query_text=neg_name,
+                    image_id=0,
+                    object_ids_output=[],
+                    is_exhaustive=True,
+                    query_processing_order=0,
+                    inference_metadata=InferenceMetadata(
+                        coco_image_id=img_id,
+                        original_image_id=img_id,
+                        original_category_id=-1,
+                        original_size=(orig_h, orig_w),
+                        object_id=-1,
+                        frame_index=-1
+                    )
+                ))
 
         return Datapoint(
             find_queries=queries,
@@ -887,10 +934,13 @@ class SAM3TrainerNative:
     def train(self):
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
+        num_negatives = self.config["training"].get("num_negatives", 2)
 
         # Load datasets using COCO format
         print_rank0(f"\nLoading training data from {data_dir}...")
-        train_ds = COCOSegmentDataset(data_dir=data_dir, split="train")
+        print_rank0(f"Hard negatives per image: {num_negatives}")
+        train_ds = COCOSegmentDataset(data_dir=data_dir, split="train",
+                                      num_negatives=num_negatives)
 
         # Check if validation data exists
         has_validation = False
@@ -898,7 +948,8 @@ class SAM3TrainerNative:
 
         try:
             print_rank0(f"\nLoading validation data from {data_dir}...")
-            val_ds = COCOSegmentDataset(data_dir=data_dir, split="valid")
+            val_ds = COCOSegmentDataset(data_dir=data_dir, split="valid",
+                                        num_negatives=num_negatives)
             if len(val_ds) > 0:
                 has_validation = True
                 print_rank0(f"Found validation data: {len(val_ds)} images")

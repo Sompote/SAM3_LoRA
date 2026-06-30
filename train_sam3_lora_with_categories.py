@@ -10,6 +10,7 @@ This version:
 
 import os
 import json
+import random
 import yaml
 from pathlib import Path
 from typing import Dict
@@ -33,10 +34,30 @@ from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, coun
 class SAM3DatasetWithCategories(Dataset):
     """Dataset that properly uses category names from COCO annotations"""
 
-    def __init__(self, root_dir, coco_file_path=None):
+    # Generic out-of-domain concepts used as additional hard negatives.
+    # These are almost never present in a specialized dataset (e.g. cracks),
+    # so they directly teach the model to NOT fire on unrelated prompts.
+    DEFAULT_GENERIC_NEGATIVES = [
+        "car", "person", "dog", "cat", "tree", "building", "sky", "road",
+        "chair", "table", "bottle", "phone", "bicycle", "bird", "flower",
+        "water", "grass", "cloud", "window", "door",
+    ]
+
+    def __init__(self, root_dir, coco_file_path=None, num_negatives=2,
+                 generic_negatives=None):
         self.root_dir = Path(root_dir)
         self.images_dir = self.root_dir / "images"
         self.annotations_dir = self.root_dir / "annotations"
+
+        # Number of hard-negative text queries to add per image.
+        # A negative query uses a category name that is NOT present in the image
+        # and expects ZERO detections (object_ids_output=[], is_exhaustive=True).
+        # This restores the model's ability to say "this prompt matches nothing",
+        # which prevents it from firing on every prompt after fine-tuning.
+        self.num_negatives = num_negatives
+        if generic_negatives is None:
+            generic_negatives = self.DEFAULT_GENERIC_NEGATIVES
+        self.generic_negatives = list(generic_negatives)
 
         # Load COCO file to get category mappings
         if coco_file_path is None:
@@ -53,6 +74,12 @@ class SAM3DatasetWithCategories(Dataset):
         print(f"📂 Loaded {len(self.categories)} categories:")
         for cat_id, cat_name in self.categories.items():
             print(f"   - ID {cat_id}: '{cat_name}'")
+
+        # Pool of all category names, used to sample hard negatives.
+        # (COCO files commonly include a background/super-category at id 0 named
+        # something generic; we keep all names here so negatives are drawn from
+        # the same vocabulary the model is being trained on.)
+        self.all_category_names = list(self.categories.values())
 
         # Build mapping: image_filename -> list of (bbox, mask, category_id)
         self.image_annotations = {}
@@ -199,6 +226,39 @@ class SAM3DatasetWithCategories(Dataset):
             )
             queries.append(query)
 
+        # --- Hard-negative text queries ---------------------------------
+        # Add prompts that should return NOTHING for this image: category
+        # names that are NOT present here. Without these the model is only ever
+        # trained on positives and learns to fire on any prompt, losing the
+        # ability to discriminate (e.g. detecting 'crack' when prompted 'car').
+        present_names = {
+            self.categories.get(cat_id, "object")
+            for cat_id in cat_id_to_object_ids
+        }
+        # Candidate negatives = other dataset categories + generic concepts,
+        # excluding anything actually present in this image.
+        neg_pool = list(self.all_category_names) + list(self.generic_negatives)
+        absent_names = sorted({n for n in neg_pool if n not in present_names})
+        if self.num_negatives > 0 and len(absent_names) > 0:
+            num_neg = min(self.num_negatives, len(absent_names))
+            for neg_name in random.sample(absent_names, num_neg):
+                neg_query = FindQueryLoaded(
+                    query_text=neg_name,
+                    image_id=0,
+                    object_ids_output=[],   # expect zero detections
+                    is_exhaustive=True,     # exhaustive => all preds are negatives
+                    query_processing_order=0,
+                    inference_metadata=InferenceMetadata(
+                        coco_image_id=idx,
+                        original_image_id=idx,
+                        original_category_id=-1,
+                        original_size=(orig_h, orig_w),
+                        object_id=-1,
+                        frame_index=-1
+                    )
+                )
+                queries.append(neg_query)
+
         return Datapoint(
             find_queries=queries,
             images=[image_obj],
@@ -255,18 +315,22 @@ class SAM3TrainerWithCategories:
         train_cfg = self.config["training"]
         train_path = Path(train_cfg["train_data_path"])
 
-        print(f"\n📁 Loading datasets...")
+        # Hard-negative text queries per image (0 disables). Defaults to 2.
+        num_negatives = train_cfg.get("num_negatives", 2)
+        print(f"\n📁 Loading datasets... (hard negatives/image: {num_negatives})")
         self.train_dataset = SAM3DatasetWithCategories(
             root_dir=train_path,
-            coco_file_path=train_path / "_annotations.coco.json"
+            coco_file_path=train_path / "_annotations.coco.json",
+            num_negatives=num_negatives
         )
 
-        # Validation dataset
+        # Validation dataset (negatives kept so val loss reflects discrimination)
         val_path = Path(train_cfg.get("val_data_path", "data/valid"))
         if val_path.exists() and (val_path / "_annotations.coco.json").exists():
             self.val_dataset = SAM3DatasetWithCategories(
                 root_dir=val_path,
-                coco_file_path=val_path / "_annotations.coco.json"
+                coco_file_path=val_path / "_annotations.coco.json",
+                num_negatives=num_negatives
             )
             print(f"✅ Validation data loaded: {len(self.val_dataset)} images")
         else:

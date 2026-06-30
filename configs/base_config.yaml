@@ -21,7 +21,7 @@ lora:
 
   # Component-level control - apply LoRA to specific SAM3 components
   apply_to_vision_encoder: true      # 32-layer ViT backbone (1008x1008 images)
-  apply_to_text_encoder: true        # Text encoder for concept prompts
+  apply_to_text_encoder: false       # FROZEN: adapting it erodes prompt discrimination
   apply_to_geometry_encoder: false   # Geometry encoder (3 layers, for bbox prompts)
   apply_to_detr_encoder: true        # DETR encoder (6 layers, vision-text fusion)
   apply_to_detr_decoder: true        # DETR decoder (6 layers, 200 object queries)
@@ -32,6 +32,7 @@ training:
   # Data
   train_data_path: "/workspace/sam3_lora/data/train"
   val_data_path: "/workspace/sam3_lora/data/valid"
+  num_negatives: 3   # Hard-negative prompts/image (must return nothing); 0 disables.
   batch_size: 20
   num_workers: 4
 

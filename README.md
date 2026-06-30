@@ -305,6 +305,42 @@ python3 train_sam3_lora_native.py
 python3 train_sam3_lora_native.py --config configs/full_lora_config.yaml
 ```
 
+### Preserving prompt discrimination (important)
+
+A common issue after fine-tuning is that the model **detects the trained objects
+regardless of the text prompt** — e.g. after training on `crack`/`hole` it still
+segments cracks when you prompt `"car"`. This happens because SAM3 is an
+open-vocabulary detector, but the dataset only ever provides **positive**
+prompts (every prompt has matching boxes). The presence head then decouples from
+the text condition and learns to "always fire."
+
+Two settings fix this:
+
+1. **Hard-negative text queries** (`num_negatives` in the training config). For
+   each image the dataloader adds prompts that must return **nothing** — other
+   dataset categories plus a generic out-of-domain pool (`car`, `person`,
+   `dog`, …). This restores the model's ability to say "this prompt matches
+   nothing here." `2`–`4` works well; `0` disables it.
+
+   ```yaml
+   training:
+     num_negatives: 3
+   ```
+
+2. **Keep the text encoder frozen** (`apply_to_text_encoder: false`). Adapting
+   the text encoder distorts SAM3's text↔image alignment — the very thing that
+   separates `crack` from `car`. Leave it frozen unless you have a strong reason
+   not to.
+
+   ```yaml
+   lora:
+     apply_to_text_encoder: false
+   ```
+
+Also avoid over-training on small datasets (hundreds of epochs amplifies the
+collapse); prefer a lower learning rate and fewer epochs, and watch the
+validation loss, which now includes the negative prompts.
+
 ### Multi-GPU Training
 
 Train on multiple GPUs using the `--device` argument. The script automatically handles distributed training setup.

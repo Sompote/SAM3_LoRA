@@ -21,9 +21,12 @@ lora:
     - "fc1"
     - "fc2"
 
-  # IMPORTANT: Enable text encoder for text prompt support!
+  # IMPORTANT: keep the text encoder FROZEN. Adapting it distorts SAM3's
+  # open-vocabulary text<->image alignment, which is what lets the model tell
+  # 'crack' apart from 'car'. Training it is a major cause of the model
+  # detecting target objects regardless of the prompt.
   apply_to_vision_encoder: true     # For visual features
-  apply_to_text_encoder: true       # ENABLED - for text prompts!
+  apply_to_text_encoder: false      # FROZEN - preserves prompt discrimination
   apply_to_geometry_encoder: false
   apply_to_detr_encoder: false
   apply_to_detr_decoder: false
@@ -35,6 +38,12 @@ training:
   val_data_path: "data/valid"
   batch_size: 1                # Start small
   num_workers: 4
+
+  # Hard-negative text queries added per image (prompts that must return
+  # NOTHING). This is the main fix for the model firing on every prompt.
+  # 0 disables; 2-4 works well. Negatives are drawn from other dataset
+  # categories plus a generic out-of-domain pool (car/person/dog/...).
+  num_negatives: 3
 
   learning_rate: 1e-4          # Higher LR to start
   weight_decay: 0.01
