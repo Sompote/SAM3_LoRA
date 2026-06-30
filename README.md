@@ -261,11 +261,23 @@ Epoch 2/100 - Train Loss: 142.891234, Val Loss: 15.641912
 ...
 ```
 
-**Validation Strategy (Following SAM3):**
+**Validation Strategy** (mirrors how SAM3's own training/eval code is organized — see note below):
 - **During training**: Only validation **loss** is computed (fast, no NMS or metrics)
 - **After training**: Run `validate_sam3_lora.py` for full metrics (mAP, cgF1) with NMS
 
-This approach significantly speeds up training while still monitoring overfitting via validation loss
+This approach significantly speeds up training while still monitoring overfitting via validation loss.
+
+> **Note on "mirrors SAM3":** this is *not* a documented policy quoted from the SAM3
+> repo — it's a design choice in this repo that follows how SAM3's code is
+> structured. Two concrete sources motivate it: (1) SAM3's trainer runs a periodic
+> validation pass that accumulates **loss/meters** on a configurable cadence
+> (`sam3/train/trainer.py`, e.g. `val_epoch_freq` / `Phase.VAL`); and (2) full
+> COCO mAP / cgF1 live in **separate offline evaluators**
+> (`sam3/eval/coco_eval_offline.py`, `sam3/eval/cgf1_eval.py`) that are run as a
+> distinct step — the COCO evaluator's own docstring notes category mAP requires
+> predicting over every `(image, class)` pair, which is why it's kept out of the
+> training loop. If you have an official SAM3 statement on eval cadence, a pointer
+> is welcome so we can cite it directly.
 
 ### 3. Run Inference
 
@@ -1354,7 +1366,7 @@ FileNotFoundError: COCO annotation file not found: /path/to/data/train/_annotati
 
 **9. Want to See mAP/cgF1 During Training?**
 **Solution:**
-- Training only computes validation loss (fast, following SAM3's approach)
+- Training only computes validation loss (fast; mirrors how SAM3's code splits loss-during-training from offline COCO/cgF1 evaluators — see the note in Quick Start)
 - After training, run `validate_sam3_lora.py` for full metrics with NMS
 - This approach significantly speeds up training while still monitoring overfitting
 - Validation loss is sufficient to detect overfitting and select best model
