@@ -17,9 +17,16 @@
 
 ## Overview
 
-Fine-tune the SAM3 (Segment Anything Model 3) using **LoRA (Low-Rank Adaptation)** - a parameter-efficient method that reduces trainable parameters from 100% to ~1% while maintaining performance.
+Fine-tune SAM3 (Segment Anything Model 3) on your own dataset using **LoRA (Low-Rank Adaptation)** — a parameter-efficient method that reduces trainable parameters from 100% to ~1% while maintaining performance. Train on a standard COCO-format dataset with text prompts taken from your category names, while preserving SAM3's open-vocabulary behavior: the fine-tuned model segments your target classes (e.g. `crack`, `hole`) and still returns **nothing** for unrelated prompts (e.g. `car`).
 
 ### Recent Updates
+
+**2026-07-05 (v0.2.0)**:
+- **Fixed loss of prompt discrimination after fine-tuning** — previously the model detected trained objects regardless of the text prompt (e.g. segmenting cracks when prompted `car`). Root cause: positive-only training queries. See [Preserving prompt discrimination](#preserving-prompt-discrimination-important)
+- **Automatic hard-negative text prompts** — new `num_negatives` config option; the trainers now add per-image prompts that must return zero detections, drawn from your other dataset categories plus a built-in generic pool
+- **Configurable negative pool** — new `generic_negatives` config option to override the built-in pool when a default concept (e.g. `road`) can genuinely appear in your images
+- **Text encoder frozen by default** (`apply_to_text_encoder: false`) to preserve SAM3's text↔image alignment
+- Validation loss now includes the negative prompts, so it tracks discrimination during training
 
 **2026-02-03**:
 - **Fixed multi-class category assignment bug** in training/validation
@@ -44,7 +51,8 @@ Fine-tune the SAM3 (Segment Anything Model 3) using **LoRA (Low-Rank Adaptation)
 - ✅ **Train on Consumer GPUs**: 16GB VRAM instead of 80GB
 - ✅ **Tiny Checkpoints**: 10-50MB LoRA weights vs 3GB full model
 - ✅ **Fast Iterations**: Less memory = faster training
-- ✅ **Easy to Use**: YAML configs + simple CLI
+- ✅ **Easy to Use**: standard COCO dataset + YAML configs + simple CLI
+- ✅ **Keeps Prompt Discrimination**: automatic hard-negative prompts, so the tuned model doesn't fire on unrelated words
 - ✅ **Production Ready**: Complete train + inference pipeline
 - ✅ **Real Applications**: Crack detection, defect inspection, and more
 - ✅ **Multi-GPU Support**: Scale training across multiple GPUs with `--device 0 1 2 3`
@@ -72,14 +80,14 @@ SAM3-LoRA applies Low-Rank Adaptation to key components of the SAM3 architecture
 
 **LoRA Adapters Applied To:**
 
-| Component | Description | LoRA Impact |
-|-----------|-------------|-------------|
-| **Vision Encoder (ViT)** | Extracts visual features from input images | High - Primary feature learning |
-| **Text Encoder** | Processes text prompts for guided segmentation | Medium - Semantic understanding |
-| **Geometry Encoder** | Handles geometric prompts (boxes, points) | Medium - Spatial reasoning |
-| **DETR Encoder** | Transformer encoder for object detection | High - Scene understanding |
-| **DETR Decoder** | Transformer decoder for object queries | High - Object localization |
-| **Mask Decoder** | Generates segmentation masks | High - Fine-grained segmentation |
+| Component | Description | Default | Notes |
+|-----------|-------------|---------|-------|
+| **Vision Encoder (ViT)** | Extracts visual features from input images | LoRA ✅ | High impact - primary feature learning |
+| **Text Encoder** | Processes text prompts for guided segmentation | **Frozen** ❄️ | Keep frozen — adapting it erodes prompt discrimination |
+| **Geometry Encoder** | Handles geometric prompts (boxes, points) | Frozen | Enable if using box/point prompts |
+| **DETR Encoder** | Transformer encoder for object detection | LoRA ✅ | High impact - vision-text fusion |
+| **DETR Decoder** | Transformer decoder for object queries | LoRA ✅ | High impact - object localization |
+| **Mask Decoder** | Generates segmentation masks | Frozen | Enable for fine-grained mask quality (on in `light_lora_config`) |
 
 **Data Flow:**
 1. **Input**: Image + Text/Geometric prompts
