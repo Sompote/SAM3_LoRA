@@ -523,6 +523,41 @@ During training, two models are automatically saved:
 ℹ️  No validation data - consider adding data/valid/ for better model selection
 ```
 
+### Merging LoRA weights into the base model
+
+If you don't want to load the LoRA adapter separately at inference time, you
+can fold it into the base weights and get a single checkpoint that loads into
+the **original SAM3 architecture** — no LoRA code or config needed:
+
+```bash
+python3 merge_lora_weights.py \
+    --config configs/full_lora_config.yaml \
+    --lora-weights outputs/sam3_lora_full/best_lora_weights.pt \
+    --output sam3_merged.pt
+```
+
+`--config` must be the **same config used for training** (the adapter file
+stores only the low-rank matrices, so the model is rebuilt with the same LoRA
+structure before merging). `--lora-weights` defaults to
+`<output_dir>/best_lora_weights.pt` from the config. Merging runs on CPU — no
+GPU needed.
+
+Load the result with stock SAM3 code:
+
+```python
+from sam3.model_builder import build_sam3_image_model
+
+model = build_sam3_image_model(load_from_HF=True, eval_mode=True,
+                               bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz")
+model.load_state_dict(torch.load("sam3_merged.pt", map_location="cpu"))
+```
+
+The merged model computes `W' = W + B^T A^T · (alpha/rank)` for every adapted
+layer, so its predictions are **numerically identical** to base + adapter.
+Trade-offs: the checkpoint is full model size (~3 GB) instead of a 10–50 MB
+adapter, and the adaptation is baked in — you can no longer swap adapters on
+one shared base model.
+
 ---
 
 ## Validation
