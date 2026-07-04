@@ -31,6 +31,9 @@ lora:
 training:
   train_data_path: "data/train"
   val_data_path: "data/val"
+  num_negatives: 3   # Hard-negative prompts/image (must return nothing); 0 disables.
+  # generic_negatives: ["car", "person", "dog"]  # Optional: replace the built-in
+  #   out-of-domain negative pool if a default concept can appear in your images.
   batch_size: 8              # Larger batch possible with fewer params
   num_workers: 4
 

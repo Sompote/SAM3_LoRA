@@ -332,11 +332,22 @@ Two settings fix this:
    each image the dataloader adds prompts that must return **nothing** — other
    dataset categories plus a generic out-of-domain pool (`car`, `person`,
    `dog`, …). This restores the model's ability to say "this prompt matches
-   nothing here." `2`–`4` works well; `0` disables it.
+   nothing here." `2`–`4` works well; `0` disables it. The shipped configs set
+   `3`; if the key is absent the trainers default to `2`.
 
    ```yaml
    training:
      num_negatives: 3
+   ```
+
+   If a concept from the default generic pool can genuinely appear in your
+   images (e.g. `road` in pavement-crack photos — teaching "no road here" on a
+   picture of a road is wrong supervision), replace the pool with objects that
+   never appear in your data:
+
+   ```yaml
+   training:
+     generic_negatives: ["car", "person", "dog", "bicycle", "bottle"]
    ```
 
 2. **Keep the text encoder frozen** (`apply_to_text_encoder: false`). Adapting

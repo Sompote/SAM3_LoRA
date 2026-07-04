@@ -45,6 +45,12 @@ training:
   # categories plus a generic out-of-domain pool (car/person/dog/...).
   num_negatives: 3
 
+  # Crack images are photos OF roads/pavement, so scene-level concepts from the
+  # default pool ('road', 'building', ...) could be genuinely present. Use a
+  # pool of objects that never appear in your images:
+  generic_negatives: ["car", "person", "dog", "cat", "bicycle", "bird",
+                      "bottle", "phone", "chair", "table", "flower"]
+
   learning_rate: 1e-4          # Higher LR to start
   weight_decay: 0.01
   adam_beta1: 0.9

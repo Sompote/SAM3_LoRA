@@ -68,6 +68,8 @@ training:
 
   num_negatives: 3   # Hard-negative prompts/image (must return nothing); 0 disables.
                      # Prevents the model from firing on every prompt after tuning.
+  # generic_negatives: ["car", "person", "dog"]  # Optional: replace the built-in
+  #   out-of-domain negative pool if a default concept can appear in your images.
 
   learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
   weight_decay: 0.01

@@ -317,11 +317,19 @@ class SAM3TrainerWithCategories:
 
         # Hard-negative text queries per image (0 disables). Defaults to 2.
         num_negatives = train_cfg.get("num_negatives", 2)
+        # Optional override of the generic out-of-domain negative pool. Set this
+        # in the config when a default concept can actually appear in your
+        # images (e.g. 'road' for pavement-crack datasets). None keeps the
+        # built-in DEFAULT_GENERIC_NEGATIVES.
+        generic_negatives = train_cfg.get("generic_negatives", None)
         print(f"\n📁 Loading datasets... (hard negatives/image: {num_negatives})")
+        if generic_negatives is not None:
+            print(f"   Custom generic negative pool: {generic_negatives}")
         self.train_dataset = SAM3DatasetWithCategories(
             root_dir=train_path,
             coco_file_path=train_path / "_annotations.coco.json",
-            num_negatives=num_negatives
+            num_negatives=num_negatives,
+            generic_negatives=generic_negatives
         )
 
         # Validation dataset (negatives kept so val loss reflects discrimination)
@@ -330,7 +338,8 @@ class SAM3TrainerWithCategories:
             self.val_dataset = SAM3DatasetWithCategories(
                 root_dir=val_path,
                 coco_file_path=val_path / "_annotations.coco.json",
-                num_negatives=num_negatives
+                num_negatives=num_negatives,
+                generic_negatives=generic_negatives
             )
             print(f"✅ Validation data loaded: {len(self.val_dataset)} images")
         else:

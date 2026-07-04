@@ -935,12 +935,20 @@ class SAM3TrainerNative:
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
         num_negatives = self.config["training"].get("num_negatives", 2)
+        # Optional override of the generic out-of-domain negative pool. Set this
+        # in the config when a default concept can actually appear in your
+        # images (e.g. 'road' for pavement-crack datasets). None keeps the
+        # built-in DEFAULT_GENERIC_NEGATIVES.
+        generic_negatives = self.config["training"].get("generic_negatives", None)
 
         # Load datasets using COCO format
         print_rank0(f"\nLoading training data from {data_dir}...")
         print_rank0(f"Hard negatives per image: {num_negatives}")
+        if generic_negatives is not None:
+            print_rank0(f"Custom generic negative pool: {generic_negatives}")
         train_ds = COCOSegmentDataset(data_dir=data_dir, split="train",
-                                      num_negatives=num_negatives)
+                                      num_negatives=num_negatives,
+                                      generic_negatives=generic_negatives)
 
         # Check if validation data exists
         has_validation = False
@@ -949,7 +957,8 @@ class SAM3TrainerNative:
         try:
             print_rank0(f"\nLoading validation data from {data_dir}...")
             val_ds = COCOSegmentDataset(data_dir=data_dir, split="valid",
-                                        num_negatives=num_negatives)
+                                        num_negatives=num_negatives,
+                                        generic_negatives=generic_negatives)
             if len(val_ds) > 0:
                 has_validation = True
                 print_rank0(f"Found validation data: {len(val_ds)} images")
