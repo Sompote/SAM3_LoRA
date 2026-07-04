@@ -2,6 +2,7 @@
 
 <div align="center">
 
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://github.com/Sompote/SAM3_LoRA)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
@@ -363,6 +364,44 @@ Two settings fix this:
 Also avoid over-training on small datasets (hundreds of epochs amplifies the
 collapse); prefer a lower learning rate and fewer epochs, and watch the
 validation loss, which now includes the negative prompts.
+
+#### Do negatives generalize to prompts outside the pool?
+
+Yes — the negative pool is **not a blocklist**. If you train with
+`generic_negatives: ["car", "person", "dog", "bicycle", "bottle"]` and later
+prompt `plane`, the model should still return nothing, even though `plane` was
+never a training negative.
+
+The negatives don't teach the model "don't fire on the word car" — they retrain
+the presence head's general decision rule: *fire only when the text embedding
+actually matches the visual features*. Each negative is one demonstration of
+that rule; the model relearns the rule, not the word list. The frozen text
+encoder is what makes this work: SAM3's pretrained encoder already places
+`plane` near `car`/`bicycle` and far from `crack`, and freezing it
+(`apply_to_text_encoder: false`) keeps that concept space intact — the
+negatives just re-anchor the presence head to use it again. A more diverse pool
+generalizes further, which is why the built-in one spans 20 varied concepts.
+
+**The caveat is near-synonyms of your target classes.** After training on
+`crack`/`hole`/`deep crack`, prompts like `scratch`, `fracture`, `gap`, or
+`line` sit close to `crack` in the text encoder's space and may still trigger
+detections. That's the model honestly saying "this concept looks like what I
+was trained to find" — whether that's desired depends on your use case. If a
+specific nearby word must return nothing, add exactly that word to
+`generic_negatives`.
+
+After retraining, spot-check three rings of prompts:
+
+1. **Trained classes** (`crack`, `hole`) — should segment correctly.
+2. **Clearly unrelated words, including ones NOT in your pool** (`plane`,
+   `banana`, `keyboard`) — should return nothing. This verifies generalization
+   rather than memorization.
+3. **Near-synonyms** (`scratch`, `gap`) — check the behavior matches what you
+   want; add problem words to the pool if not.
+
+If ring 2 still fires, increase `num_negatives`, diversify the pool, or reduce
+over-training (fewer epochs / lower LR) — don't try to enumerate every English
+word.
 
 ### Multi-GPU Training
 
