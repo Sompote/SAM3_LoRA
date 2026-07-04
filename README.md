@@ -1656,9 +1656,10 @@ If you use this work, please cite:
 @software{sam3_lora,
   title = {SAM3-LoRA: Low-Rank Adaptation for Fine-Tuning},
   author = {AI Research Group, KMUTT},
-  year = {2025},
+  year = {2026},
+  version = {0.2.0},
   organization = {King Mongkut's University of Technology Thonburi},
-  url = {https://github.com/yourusername/sam3_lora}
+  url = {https://github.com/Sompote/SAM3_LoRA}
 }
 ```
 
