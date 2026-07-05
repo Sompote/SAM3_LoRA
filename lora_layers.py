@@ -383,7 +383,10 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
             return False
         if ("detr_decoder" in module_name or "transformer.decoder" in module_name) and not config.apply_to_detr_decoder:
             return False
-        if "mask_decoder" in module_name and not config.apply_to_mask_decoder:
+        # SAM3's mask module is named 'segmentation_head' (there is no module
+        # containing 'mask_decoder'); match both so the flag actually works.
+        if ("mask_decoder" in module_name or "segmentation_head" in module_name) \
+                and not config.apply_to_mask_decoder:
             return False
         return True
 

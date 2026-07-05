@@ -21,6 +21,9 @@ Fine-tune SAM3 (Segment Anything Model 3) on your own dataset using **LoRA (Low-
 
 ### Recent Updates
 
+**2026-07-05**:
+- **Fixed `apply_to_mask_decoder` having no effect** (#28) — SAM3's mask module is named `segmentation_head`, which the component filter didn't match, so the flag was silently ignored (and the head's cross-attention was always adapted regardless of the setting). The flag now correctly controls LoRA on the segmentation head.
+
 **2026-07-05 (v0.2.0)**:
 - **Fixed loss of prompt discrimination after fine-tuning** — previously the model detected trained objects regardless of the text prompt (e.g. segmenting cracks when prompted `car`). Root cause: positive-only training queries. See [Preserving prompt discrimination](#preserving-prompt-discrimination-important)
 - **Automatic hard-negative text prompts** — new `num_negatives` config option; the trainers now add per-image prompts that must return zero detections, drawn from your other dataset categories plus a built-in generic pool
