@@ -9,7 +9,7 @@
 
 **Train SAM3 segmentation models with 99% fewer trainable parameters**
 
-[Quick Start](#quick-start) • [Architecture](#architecture) • [Training](#training) • [Inference](#inference) • [Examples](#real-world-example-concrete-crack-detection) • [Configuration](#configuration)
+[Quick Start](#quick-start) • [Architecture](#architecture) • [Training](#training) • [Validation](#validation) • [Inference](#inference) • [Examples](#real-world-example-concrete-crack-detection) • [Configuration](#configuration) • [Troubleshooting](#troubleshooting)
 
 </div>
 
@@ -21,15 +21,13 @@ Fine-tune SAM3 (Segment Anything Model 3) on your own dataset using **LoRA (Low-
 
 ### Recent Updates
 
-**2026-07-05**:
-- **Fixed `apply_to_mask_decoder` having no effect** (#28) — SAM3's mask module is named `segmentation_head`, which the component filter didn't match, so the flag was silently ignored (and the head's cross-attention was always adapted regardless of the setting). The flag now correctly controls LoRA on the segmentation head.
-
 **2026-07-05 (v0.2.0)**:
 - **Fixed loss of prompt discrimination after fine-tuning** — previously the model detected trained objects regardless of the text prompt (e.g. segmenting cracks when prompted `car`). Root cause: positive-only training queries. See [Preserving prompt discrimination](#preserving-prompt-discrimination-important)
-- **Automatic hard-negative text prompts** — new `num_negatives` config option; the trainers now add per-image prompts that must return zero detections, drawn from your other dataset categories plus a built-in generic pool
-- **Configurable negative pool** — new `generic_negatives` config option to override the built-in pool when a default concept (e.g. `road`) can genuinely appear in your images
+- **Automatic hard-negative text prompts** — new `num_negatives` config option; the trainers now add per-image prompts that must return zero detections, drawn from your other dataset categories plus a built-in generic pool. New `generic_negatives` config option overrides the pool when a default concept (e.g. `road`) can genuinely appear in your images. Validation loss includes the negative prompts, so it tracks discrimination during training
 - **Text encoder frozen by default** (`apply_to_text_encoder: false`) to preserve SAM3's text↔image alignment
-- Validation loss now includes the negative prompts, so it tracks discrimination during training
+- **Fixed `apply_to_mask_decoder` having no effect** (#28) — SAM3's mask module is named `segmentation_head`, which the component filter didn't match, so the flag was silently ignored (and the head's cross-attention was always adapted regardless of the setting). The flag now correctly controls LoRA on the segmentation head
+- **New: merge LoRA into the base model** (#30) — `merge_lora_weights.py` folds a trained adapter into the base weights, producing a single checkpoint that loads into stock SAM3 with no LoRA code. See [Merging LoRA weights](#merging-lora-weights-into-the-base-model)
+- **New: RefCOCO / RRSIS-D support** (#26) — `convert_refcoco_to_coco.py` converts referring-expression datasets to the trainers' COCO layout, with expression-level (`--mode ref`) or class-level (`--mode category`) prompts. See [Prepare Your Data](#1-prepare-your-data)
 
 **2026-02-03**:
 - **Fixed multi-class category assignment bug** in training/validation
@@ -126,7 +124,7 @@ Before installing, you need to:
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/sam3_lora.git
+git clone https://github.com/Sompote/SAM3_LoRA.git
 cd SAM3_LoRA
 
 # Install dependencies
@@ -1013,10 +1011,11 @@ for idx, prompt in enumerate(["crack", "defect"]):
 | Flag | Description | When to Enable |
 |------|-------------|----------------|
 | `apply_to_vision_encoder` | Vision backbone | Always (main feature extractor) |
-| `apply_to_mask_decoder` | Mask generation | Recommended for segmentation |
-| `apply_to_detr_encoder` | Object detection encoder | For complex scenes |
-| `apply_to_detr_decoder` | Object detection decoder | For complex scenes |
-| `apply_to_text_encoder` | Text understanding | For text-based prompts |
+| `apply_to_detr_encoder` | Object detection encoder (vision-text fusion) | Recommended |
+| `apply_to_detr_decoder` | Object detection decoder (object queries) | Recommended |
+| `apply_to_mask_decoder` | Segmentation head (mask generation) | Optional — adapts the head's prompt cross-attention |
+| `apply_to_geometry_encoder` | Box/point prompt encoder | Only if training with geometric prompts |
+| `apply_to_text_encoder` | Text understanding | **Keep `false`** — adapting it erodes prompt discrimination (see [Preserving prompt discrimination](#preserving-prompt-discrimination-important)) |
 
 ### Preset Configurations
 
@@ -1380,8 +1379,8 @@ load_lora_weights(model, "my_lora_weights.pt")
 ## Project Structure
 
 ```
-sam3_lora/
-├── configs/
+SAM3_LoRA/
+├── configs/                       # Training configs (base, full, light, minimal, crack detection)
 │   └── full_lora_config.yaml      # Default training config
 ├── data/                          # COCO format dataset
 │   ├── train/
@@ -1402,10 +1401,13 @@ sam3_lora/
 ├── sam3/                          # SAM3 model library
 ├── lora_layers.py                 # LoRA implementation
 ├── train_sam3_lora_native.py      # Training script (computes validation loss only)
+├── train_sam3_lora_with_categories.py  # Alternative trainer (category-focused)
 ├── validate_sam3_lora.py          # Full evaluation script (mAP, cgF1, NMS)
 ├── validate_single_image.py       # Single image validation with visualization
 ├── infer_sam.py                   # Inference script (recommended)
 ├── inference_lora.py              # Legacy inference script
+├── merge_lora_weights.py          # Fold a trained adapter into the base weights
+├── convert_refcoco_to_coco.py     # RefCOCO/RRSIS-D -> COCO layout converter
 ├── README_INFERENCE.md            # Detailed inference guide
 └── README.md                      # This file
 ```
@@ -1743,7 +1745,7 @@ This project is licensed under Apache 2.0. See [LICENSE](LICENSE) for details.
 
 <div align="center">
 
-**Version**: 1.0.0
+**Version**: 0.2.0
 **Python**: 3.8+
 **PyTorch**: 2.0+
 
