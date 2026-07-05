@@ -228,6 +228,25 @@ data/
 - **Polygon**: `"segmentation": [[x1, y1, x2, y2, ...]]` (list of polygons)
 - **RLE**: `"segmentation": {"counts": "...", "size": [h, w]}` (run-length encoded)
 
+**Using RefCOCO-format datasets (RefCOCO, RRSIS-D, ...):** referring-expression
+datasets ship as `instances.json` + a `refs(*).p` pickle instead of per-split
+COCO files. Convert them with:
+
+```bash
+python3 convert_refcoco_to_coco.py \
+    --refcoco-dir RRSIS-D/rrsisd \
+    --images-dir RRSIS-D/images/rrsisd/JPEGImages \
+    --output-dir data/rrsisd_coco \
+    --mode ref
+```
+
+`--mode ref` (default) turns each referring expression into a text prompt for
+exactly the one instance it refers to — true referring segmentation; keep
+`num_negatives` enabled so other expressions serve as hard negatives.
+`--mode category` ignores the expressions and produces plain class-level
+detection data from the original COCO categories. Use `--symlink` to link
+images instead of copying.
+
 ### 2. Train Your Model
 
 ```bash
