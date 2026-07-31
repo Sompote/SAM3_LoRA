@@ -260,7 +260,26 @@ def load_ground_truth(image_path, data_dir):
     return gt_masks, prompt
 
 
-def visualize_comparison(image_path, lora_results, base_results, gt_masks, output_path, prompt):
+def draw_detections(ax, boxes, scores, color, show_boxes, show_scores):
+    """Draw bounding boxes and/or confidence labels for detections."""
+    if boxes is None or not (show_boxes or show_scores):
+        return
+    for i, (x1, y1, x2, y2) in enumerate(boxes):
+        if show_boxes:
+            ax.add_patch(patches.Rectangle(
+                (x1, y1), x2 - x1, y2 - y1,
+                linewidth=2, edgecolor=color, facecolor='none'
+            ))
+        if show_scores and scores is not None:
+            ax.text(
+                x1, max(y1 - 5, 0), f"{scores[i]:.2f}",
+                bbox=dict(facecolor=color, alpha=0.5),
+                fontsize=10, color='white'
+            )
+
+
+def visualize_comparison(image_path, lora_results, base_results, gt_masks, output_path, prompt,
+                         show_boxes=False, show_scores=True):
     """Create side-by-side comparison visualization with ground truth"""
     pil_image, lora_boxes, lora_scores, lora_masks, lora_count = lora_results
     _, base_boxes, base_scores, base_masks, base_count = base_results
@@ -285,6 +304,8 @@ def visualize_comparison(image_path, lora_results, base_results, gt_masks, outpu
         for mask in lora_masks:
             overlay[mask] = [1, 0, 0, 0.5]  # Red
         axes[1].imshow(overlay)
+    if lora_count > 0:
+        draw_detections(axes[1], lora_boxes, lora_scores, 'red', show_boxes, show_scores)
     axes[1].set_title(f'LoRA Model ({lora_count} detections)', fontsize=14, fontweight='bold')
     axes[1].axis('off')
 
@@ -295,6 +316,8 @@ def visualize_comparison(image_path, lora_results, base_results, gt_masks, outpu
         for mask in base_masks:
             overlay[mask] = [0, 0, 1, 0.5]  # Blue
         axes[2].imshow(overlay)
+    if base_count > 0:
+        draw_detections(axes[2], base_boxes, base_scores, 'blue', show_boxes, show_scores)
     axes[2].set_title(f'Base Model ({base_count} detections)', fontsize=14, fontweight='bold')
     axes[2].axis('off')
 
@@ -320,6 +343,10 @@ def main():
     parser.add_argument('--output', type=str, required=True, help='Output comparison image path')
     parser.add_argument('--threshold', type=float, default=0.5, help='Detection threshold')
     parser.add_argument('--resolution', type=int, default=1008, help='Input resolution')
+    parser.add_argument('--boundingbox', type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=False, help='Show bounding boxes: True or False (default: False)')
+    parser.add_argument('--score', type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=True, help='Show confidence scores: True or False (default: True)')
 
     args = parser.parse_args()
 
@@ -354,7 +381,8 @@ def main():
     # Create visualization
     print("\nCreating comparison...")
     os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
-    visualize_comparison(args.image, lora_results, base_results, gt_masks, args.output, prompt)
+    visualize_comparison(args.image, lora_results, base_results, gt_masks, args.output, prompt,
+                         show_boxes=args.boundingbox, show_scores=args.score)
 
     print(f"\nGround Truth: {len(gt_masks)} masks")
     print(f"LoRA: {lora_results[4]} detections")

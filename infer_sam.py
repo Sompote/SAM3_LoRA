@@ -338,7 +338,8 @@ class SAM3LoRAInference:
         results: dict,
         output_path: str,
         show_boxes: bool = True,
-        show_masks: bool = True
+        show_masks: bool = True,
+        show_scores: bool = True
     ):
         """
         Visualize predictions on image.
@@ -348,6 +349,9 @@ class SAM3LoRAInference:
             output_path: Where to save visualization
             show_boxes: Whether to show bounding boxes
             show_masks: Whether to show segmentation masks
+            show_scores: Whether to show confidence labels (works with or
+                without boxes; without boxes the label sits at the detection's
+                top-left corner)
         """
         pil_image = results['_image']
 
@@ -391,8 +395,8 @@ class SAM3LoRAInference:
                         colored_mask[mask] = [1, 1, 0, 0.4]
                     ax.imshow(colored_mask)
 
-                # Draw box
-                if show_boxes and boxes is not None:
+                # Draw box and/or confidence label
+                if (show_boxes or show_scores) and boxes is not None:
                     box = boxes[i]  # [x1, y1, x2, y2]
                     x1, y1, x2, y2 = box
 
@@ -403,28 +407,25 @@ class SAM3LoRAInference:
                     x2 = max(0, min(img_w, x2))
                     y2 = max(0, min(img_h, y2))
 
-                    width = x2 - x1
-                    height = y2 - y1
+                    if show_boxes:
+                        rect = patches.Rectangle(
+                            (x1, y1), x2 - x1, y2 - y1,
+                            linewidth=2,
+                            edgecolor=color,
+                            facecolor='none'
+                        )
+                        ax.add_patch(rect)
 
-                    # Draw rectangle
-                    rect = patches.Rectangle(
-                        (x1, y1), width, height,
-                        linewidth=2,
-                        edgecolor=color,
-                        facecolor='none'
-                    )
-                    ax.add_patch(rect)
-
-                    # Add label
-                    score = scores[i] if scores is not None else 0
-                    label = f"{prompt}: {score:.2f}"
-                    ax.text(
-                        x1, y1 - 5,
-                        label,
-                        bbox=dict(facecolor=color, alpha=0.5),
-                        fontsize=10,
-                        color='white'
-                    )
+                    if show_scores:
+                        score = scores[i] if scores is not None else 0
+                        label = f"{prompt}: {score:.2f}"
+                        ax.text(
+                            x1, max(y1 - 5, 0),
+                            label,
+                            bbox=dict(facecolor=color, alpha=0.5),
+                            fontsize=10,
+                            color='white'
+                        )
 
         ax.axis('off')
 
@@ -492,6 +493,12 @@ def main():
         help="Show bounding boxes: True or False (default: False)"
     )
     parser.add_argument(
+        "--score",
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=True,
+        help="Show confidence scores: True or False (default: True)"
+    )
+    parser.add_argument(
         "--no-masks",
         action="store_true",
         help="Don't show segmentation masks"
@@ -522,7 +529,8 @@ def main():
         results,
         args.output,
         show_boxes=args.boundingbox,
-        show_masks=not args.no_masks
+        show_masks=not args.no_masks,
+        show_scores=args.score
     )
 
     # Print summary

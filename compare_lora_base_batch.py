@@ -10,6 +10,7 @@ import torch
 import numpy as np
 from PIL import Image as PILImage
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import yaml
 import pycocotools.mask as mask_utils
 from pathlib import Path
@@ -155,12 +156,23 @@ def predict(model, image_path, prompt, resolution=1008, threshold=0.5, device='c
     num_keep = keep.sum().item()
 
     if num_keep == 0:
-        return pil_image, None, 0
+        return pil_image, None, None, None, 0
+
+    # Convert kept boxes from normalized cxcywh to pixel xyxy
+    orig_w, orig_h = pil_image.size
+    cx, cy, w_box, h_box = pred_boxes[0, keep].unbind(-1)
+    boxes_xyxy = torch.stack([
+        (cx - w_box / 2) * orig_w,
+        (cy - h_box / 2) * orig_h,
+        (cx + w_box / 2) * orig_w,
+        (cy + h_box / 2) * orig_h,
+    ], dim=-1).cpu().numpy()
+
+    scores_np = scores[keep].cpu().numpy()
 
     if pred_masks is not None:
         import torch.nn.functional as F
         masks_small = pred_masks[0, keep].sigmoid() > 0.5
-        orig_h, orig_w = pil_image.size[1], pil_image.size[0]
         masks_resized = F.interpolate(
             masks_small.unsqueeze(0).float(),
             size=(orig_h, orig_w),
@@ -171,7 +183,7 @@ def predict(model, image_path, prompt, resolution=1008, threshold=0.5, device='c
     else:
         masks_np = None
 
-    return pil_image, masks_np, num_keep
+    return pil_image, boxes_xyxy, scores_np, masks_np, num_keep
 
 
 def load_ground_truth(image_path, data_dir):
@@ -225,7 +237,25 @@ def load_ground_truth(image_path, data_dir):
     return gt_masks, prompt
 
 
-def create_combined_visualization(image_results, output_path):
+def draw_detections(ax, boxes, scores, color, show_boxes, show_scores):
+    """Draw bounding boxes and/or confidence labels for detections."""
+    if boxes is None or not (show_boxes or show_scores):
+        return
+    for i, (x1, y1, x2, y2) in enumerate(boxes):
+        if show_boxes:
+            ax.add_patch(patches.Rectangle(
+                (x1, y1), x2 - x1, y2 - y1,
+                linewidth=2, edgecolor=color, facecolor='none'
+            ))
+        if show_scores and scores is not None:
+            ax.text(
+                x1, max(y1 - 5, 0), f"{scores[i]:.2f}",
+                bbox=dict(facecolor=color, alpha=0.5),
+                fontsize=10, color='white'
+            )
+
+
+def create_combined_visualization(image_results, output_path, show_boxes=False, show_scores=True):
     """Create a single large visualization with all images"""
     num_images = len(image_results)
 
@@ -240,8 +270,12 @@ def create_combined_visualization(image_results, output_path):
         image_name = result['image_name']
         pil_image = result['pil_image']
         gt_masks = result['gt_masks']
+        lora_boxes = result['lora_boxes']
+        lora_scores = result['lora_scores']
         lora_masks = result['lora_masks']
         lora_count = result['lora_count']
+        base_boxes = result['base_boxes']
+        base_scores = result['base_scores']
         base_masks = result['base_masks']
         base_count = result['base_count']
         prompt = result['prompt']
@@ -270,6 +304,8 @@ def create_combined_visualization(image_results, output_path):
             for mask in lora_masks:
                 overlay[mask] = [1, 0, 0, 0.5]  # Red
             axes[idx, 1].imshow(overlay)
+        if lora_count > 0:
+            draw_detections(axes[idx, 1], lora_boxes, lora_scores, 'red', show_boxes, show_scores)
         axes[idx, 1].set_title(f'LoRA ({lora_count})', fontsize=12, fontweight='bold')
         axes[idx, 1].axis('off')
 
@@ -280,6 +316,8 @@ def create_combined_visualization(image_results, output_path):
             for mask in base_masks:
                 overlay[mask] = [0, 0, 1, 0.5]  # Blue
             axes[idx, 2].imshow(overlay)
+        if base_count > 0:
+            draw_detections(axes[idx, 2], base_boxes, base_scores, 'blue', show_boxes, show_scores)
         axes[idx, 2].set_title(f'Base ({base_count})', fontsize=12, fontweight='bold')
         axes[idx, 2].axis('off')
 
@@ -304,6 +342,10 @@ def main():
     parser.add_argument('--output', type=str, required=True, help='Output combined image path')
     parser.add_argument('--threshold', type=float, default=0.5, help='Detection threshold')
     parser.add_argument('--resolution', type=int, default=1008, help='Input resolution')
+    parser.add_argument('--boundingbox', type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=False, help='Show bounding boxes: True or False (default: False)')
+    parser.add_argument('--score', type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=True, help='Show confidence scores: True or False (default: True)')
 
     args = parser.parse_args()
 
@@ -329,13 +371,13 @@ def main():
         print(f"  GT: {len(gt_masks)} masks | Prompt: {prompt}")
 
         # Run LoRA model
-        pil_image, lora_masks, lora_count = predict(
+        pil_image, lora_boxes, lora_scores, lora_masks, lora_count = predict(
             lora_model, image_path, prompt, args.resolution, args.threshold, device
         )
         print(f"  LoRA: {lora_count} detections")
 
         # Run Base model
-        _, base_masks, base_count = predict(
+        _, base_boxes, base_scores, base_masks, base_count = predict(
             base_model, image_path, prompt, args.resolution, args.threshold, device
         )
         print(f"  Base: {base_count} detections")
@@ -344,8 +386,12 @@ def main():
             'image_name': os.path.basename(image_path),
             'pil_image': pil_image,
             'gt_masks': gt_masks,
+            'lora_boxes': lora_boxes,
+            'lora_scores': lora_scores,
             'lora_masks': lora_masks,
             'lora_count': lora_count,
+            'base_boxes': base_boxes,
+            'base_scores': base_scores,
             'base_masks': base_masks,
             'base_count': base_count,
             'prompt': prompt
@@ -354,7 +400,8 @@ def main():
     # Create combined visualization
     print("\nCreating combined visualization...")
     os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else ".", exist_ok=True)
-    create_combined_visualization(results, args.output)
+    create_combined_visualization(results, args.output,
+                                  show_boxes=args.boundingbox, show_scores=args.score)
 
     # Print summary
     print("\n" + "="*60)
