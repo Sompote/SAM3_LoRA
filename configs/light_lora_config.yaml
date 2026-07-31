@@ -32,9 +32,13 @@ lora:
 # Training settings
 training:
   data_dir: "/workspace/data2"
-  num_negatives: 3      # Hard-negative prompts/image (must return nothing); 0 disables.
+  # Hard-negative prompts (must return nothing). Dataset categories absent from
+  # an image are ALWAYS added as negatives; num_negatives controls only the
+  # extra generic out-of-domain prompts sampled per image (0 disables them).
+  num_negatives: 3
   # generic_negatives: ["car", "person", "dog"]  # Optional: replace the built-in
   #   out-of-domain negative pool if a default concept can appear in your images.
+  #   (Pool entries sharing a word with a dataset category are auto-removed.)
   batch_size: 2         # Larger than full config (fewer LoRA params)
   num_workers: 2
 

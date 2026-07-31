@@ -32,7 +32,9 @@ training:
   # Data
   train_data_path: "/workspace/sam3_lora/data/train"
   val_data_path: "/workspace/sam3_lora/data/valid"
-  num_negatives: 3   # Hard-negative prompts/image (must return nothing); 0 disables.
+  # Absent dataset categories are ALWAYS added as negatives; num_negatives
+  # controls only the extra generic prompts sampled per image (0 disables).
+  num_negatives: 3
   # generic_negatives: ["car", "person", "dog"]  # Optional: replace the built-in
   #   out-of-domain negative pool. Set this if a default concept (car, person,
   #   dog, cat, tree, building, sky, road, ...) can actually appear in your

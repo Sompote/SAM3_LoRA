@@ -75,11 +75,23 @@ class SAM3DatasetWithCategories(Dataset):
         for cat_id, cat_name in self.categories.items():
             print(f"   - ID {cat_id}: '{cat_name}'")
 
-        # Pool of all category names, used to sample hard negatives.
-        # (COCO files commonly include a background/super-category at id 0 named
-        # something generic; we keep all names here so negatives are drawn from
-        # the same vocabulary the model is being trained on.)
-        self.all_category_names = list(self.categories.values())
+        # Categories that actually have annotations (skips e.g. Roboflow's
+        # unused background/supercategory entry). These are the in-domain
+        # hard negatives: every image gets a must-return-nothing query for
+        # each of these classes it does not contain.
+        used_cat_ids = {ann['category_id'] for ann in self.coco_data['annotations']}
+        self.used_category_names = sorted(
+            {self.categories[cid].lower() for cid in used_cat_ids if cid in self.categories}
+        )
+
+        # Drop generic negatives that share a word with any dataset category
+        # (e.g. 'water' vs 'water ingress'): training them to return nothing
+        # contradicts the related positive class and erodes discrimination.
+        category_words = {w for name in self.used_category_names for w in name.split()}
+        self.generic_negatives = [
+            n for n in self.generic_negatives
+            if not set(n.lower().split()) & category_words
+        ]
 
         # Build mapping: image_filename -> list of (bbox, mask, category_id)
         self.image_annotations = {}
@@ -227,37 +239,43 @@ class SAM3DatasetWithCategories(Dataset):
             queries.append(query)
 
         # --- Hard-negative text queries ---------------------------------
-        # Add prompts that should return NOTHING for this image: category
-        # names that are NOT present here. Without these the model is only ever
-        # trained on positives and learns to fire on any prompt, losing the
-        # ability to discriminate (e.g. detecting 'crack' when prompted 'car').
+        # Prompts that should return NOTHING for this image. Two tiers:
+        #   1. In-domain: every dataset category absent from this image is
+        #      ALWAYS included. These are the confusable prompts (e.g. 'crack'
+        #      on a water-ingress streak); sampling them randomly makes the
+        #      signal too rare for the model to keep the classes apart.
+        #   2. Generic out-of-domain concepts: num_negatives sampled per image.
         present_names = {
-            self.categories.get(cat_id, "object")
+            self.categories.get(cat_id, "object").lower()
             for cat_id in cat_id_to_object_ids
         }
-        # Candidate negatives = other dataset categories + generic concepts,
-        # excluding anything actually present in this image.
-        neg_pool = list(self.all_category_names) + list(self.generic_negatives)
-        absent_names = sorted({n for n in neg_pool if n not in present_names})
-        if self.num_negatives > 0 and len(absent_names) > 0:
-            num_neg = min(self.num_negatives, len(absent_names))
-            for neg_name in random.sample(absent_names, num_neg):
-                neg_query = FindQueryLoaded(
-                    query_text=neg_name,
-                    image_id=0,
-                    object_ids_output=[],   # expect zero detections
-                    is_exhaustive=True,     # exhaustive => all preds are negatives
-                    query_processing_order=0,
-                    inference_metadata=InferenceMetadata(
-                        coco_image_id=idx,
-                        original_image_id=idx,
-                        original_category_id=-1,
-                        original_size=(orig_h, orig_w),
-                        object_id=-1,
-                        frame_index=-1
-                    )
+
+        def negative_query(neg_name):
+            return FindQueryLoaded(
+                query_text=neg_name,
+                image_id=0,
+                object_ids_output=[],   # expect zero detections
+                is_exhaustive=True,     # exhaustive => all preds are negatives
+                query_processing_order=0,
+                inference_metadata=InferenceMetadata(
+                    coco_image_id=idx,
+                    original_image_id=idx,
+                    original_category_id=-1,
+                    original_size=(orig_h, orig_w),
+                    object_id=-1,
+                    frame_index=-1
                 )
-                queries.append(neg_query)
+            )
+
+        for neg_name in self.used_category_names:
+            if neg_name not in present_names:
+                queries.append(negative_query(neg_name))
+
+        generic_pool = sorted({n.lower() for n in self.generic_negatives} - present_names)
+        if self.num_negatives > 0 and len(generic_pool) > 0:
+            num_neg = min(self.num_negatives, len(generic_pool))
+            for neg_name in random.sample(generic_pool, num_neg):
+                queries.append(negative_query(neg_name))
 
         return Datapoint(
             find_queries=queries,

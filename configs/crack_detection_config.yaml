@@ -41,8 +41,9 @@ training:
 
   # Hard-negative text queries added per image (prompts that must return
   # NOTHING). This is the main fix for the model firing on every prompt.
-  # 0 disables; 2-4 works well. Negatives are drawn from other dataset
-  # categories plus a generic out-of-domain pool (car/person/dog/...).
+  # Dataset categories absent from an image are ALWAYS added as negatives;
+  # num_negatives controls only the extra generic out-of-domain prompts
+  # sampled per image (0 disables them; 2-4 works well).
   num_negatives: 3
 
   # Crack images are photos OF roads/pavement, so scene-level concepts from the

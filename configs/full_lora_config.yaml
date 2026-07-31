@@ -66,10 +66,15 @@ training:
   batch_size: 4      # Increased from 1 to reduce gradient variance
   num_workers: 2        # Increase for better data loading
 
-  num_negatives: 3   # Hard-negative prompts/image (must return nothing); 0 disables.
-                     # Prevents the model from firing on every prompt after tuning.
+  # Hard-negative prompts (must return nothing). Dataset categories absent from
+  # an image are ALWAYS added as negatives, so confusable classes (e.g. 'crack'
+  # vs 'water ingress') get negative supervision on every image. num_negatives
+  # controls only the extra generic out-of-domain prompts sampled per image;
+  # 0 disables that generic tier.
+  num_negatives: 3
   # generic_negatives: ["car", "person", "dog"]  # Optional: replace the built-in
   #   out-of-domain negative pool if a default concept can appear in your images.
+  #   (Pool entries sharing a word with a dataset category are auto-removed.)
 
   learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
   weight_decay: 0.01
