@@ -241,7 +241,19 @@ class COCOSegmentDataset(Dataset):
         )
 
 
-def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.15):
+def _dilate_masks(binary_masks, radius):
+    """Dilate binary masks [N, H, W] by `radius` pixels (max-pool dilation)."""
+    if radius <= 0:
+        return binary_masks
+    kernel = 2 * radius + 1
+    dilated = torch.nn.functional.max_pool2d(
+        binary_masks.float().unsqueeze(1),
+        kernel_size=kernel, stride=1, padding=radius
+    ).squeeze(1)
+    return dilated > 0.5
+
+
+def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.15, dilate=0):
     """
     Merge overlapping masks that likely represent the same object (e.g., crack segments).
 
@@ -253,6 +265,11 @@ def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.15):
         scores: Confidence scores [N]
         boxes: Bounding boxes [N, 4]
         iou_threshold: IoU threshold for merging (default: 0.15, lower = more aggressive)
+        dilate: Dilation radius in pixels. When > 0, masks are dilated by this
+            many pixels and any two fragments whose dilated masks TOUCH are
+            merged. This joins disjoint portions of one crack (which have
+            mask IoU 0 and are never merged by the IoU test alone). The
+            merged output keeps the ORIGINAL (undilated) masks.
 
     Returns:
         Tuple of (merged_masks, merged_scores, merged_boxes)
@@ -266,6 +283,8 @@ def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.15):
     scores = scores[sorted_indices]
     boxes = boxes[sorted_indices]
 
+    dilated_masks = _dilate_masks(binary_masks, dilate) if dilate > 0 else None
+
     merged_masks = []
     merged_scores = []
     merged_boxes = []
@@ -276,6 +295,7 @@ def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.15):
             continue
 
         current_mask = binary_masks[i].clone()
+        current_dilated = dilated_masks[i].clone() if dilated_masks is not None else None
         current_score = scores[i].item()
         current_box = boxes[i]
         used[i] = True
@@ -285,14 +305,22 @@ def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.15):
             if used[j]:
                 continue
 
-            # Compute IoU
-            intersection = (current_mask & binary_masks[j]).sum().item()
-            union = (current_mask | binary_masks[j]).sum().item()
-            iou = intersection / union if union > 0 else 0
+            if current_dilated is not None:
+                # Proximity criterion: merge if the dilated masks touch at all.
+                # (IoU of thin dilated fragments is tiny even when they belong
+                # to the same crack, so a threshold test would never fire.)
+                should_merge = (current_dilated & dilated_masks[j]).any().item()
+            else:
+                # Overlap criterion: IoU of the raw masks
+                intersection = (current_mask & binary_masks[j]).sum().item()
+                union = (current_mask | binary_masks[j]).sum().item()
+                iou = intersection / union if union > 0 else 0
+                should_merge = iou > iou_threshold
 
-            # If overlaps significantly, merge it
-            if iou > iou_threshold:
+            if should_merge:
                 current_mask = current_mask | binary_masks[j]
+                if current_dilated is not None:
+                    current_dilated = current_dilated | dilated_masks[j]
                 current_score = max(current_score, scores[j].item())
                 used[j] = True
 
@@ -364,7 +392,8 @@ def apply_sam3_nms(pred_logits, pred_masks, pred_boxes, prob_threshold=0.3, nms_
 
 def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=288,
                                        prob_threshold=0.3, nms_iou_threshold=0.7, max_detections=100,
-                                       merge_cracks=False, merge_iou_threshold=0.15):
+                                       merge_cracks=False, merge_iou_threshold=0.15,
+                                       merge_dilate=0, use_presence=True):
     """
     Convert model predictions to COCO format using SAM3's NMS pipeline.
 
@@ -377,6 +406,16 @@ def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=2
         max_detections: Max detections per image (default: 100)
         merge_cracks: If True, merge overlapping segments instead of NMS suppression (default: False)
         merge_iou_threshold: IoU threshold for merging (default: 0.15, lower = more aggressive)
+        merge_dilate: Dilation radius (pixels at 288 resolution) for merging.
+            When > 0, disjoint fragments whose dilated masks touch are merged
+            into one instance (joins split cracks). Only used with merge_cracks.
+        use_presence: Multiply per-query scores by the prompt-level presence
+            score, like SAM3's official PostProcessImage. The image model does
+            NOT fold presence into pred_logits (supervise_joint_box_scores is
+            only set for the video model), so raw logits alone are uncalibrated
+            for the zero-shot baseline: queries score high even when the
+            presence head says the concept is absent, flooding the eval with
+            false positives (baseline mAP collapses to ~0).
     """
     coco_predictions = []
     pred_id = 0
@@ -384,10 +423,13 @@ def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=2
     if merge_cracks:
         print(f"\n[INFO] Converting {len(predictions_list)} predictions to COCO format...")
         print(f"[INFO] Using CRACK MERGING mode: prob_threshold={prob_threshold}, merge_iou={merge_iou_threshold}, max_dets={max_detections}")
+        if merge_dilate > 0:
+            print(f"[INFO] Proximity merging ENABLED: fragments within ~{2*merge_dilate}px (dilate={merge_dilate}) are joined into one instance")
         print(f"[INFO] This will MERGE overlapping crack segments instead of suppressing them")
     else:
         print(f"\n[INFO] Converting {len(predictions_list)} predictions to COCO format...")
         print(f"[INFO] Using SAM3 NMS: prob_threshold={prob_threshold}, nms_iou={nms_iou_threshold}, max_dets={max_detections}")
+    print(f"[INFO] Presence scoring: {'ENABLED (score = sigmoid(logit) * sigmoid(presence))' if use_presence else 'DISABLED (raw logits)'}")
 
     for img_id, preds in tqdm(zip(image_ids, predictions_list), total=len(predictions_list), desc="Converting predictions"):
         if preds is None or len(preds.get('pred_logits', [])) == 0:
@@ -396,6 +438,16 @@ def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=2
         logits = preds['pred_logits']  # [N, 1]
         boxes = preds['pred_boxes']    # [N, 4]
         masks = preds['pred_masks']    # [N, H, W]
+
+        # Joint score like SAM3's PostProcessImage (use_presence=True): multiply
+        # each query's probability by the prompt-level presence probability,
+        # then convert back to a logit so the downstream NMS/threshold code
+        # (which applies sigmoid itself) operates on the joint score.
+        presence_logit = preds.get('presence_logit', None)
+        if use_presence and presence_logit is not None:
+            presence_prob = torch.sigmoid(presence_logit.float()).reshape(-1)[0]
+            joint_probs = torch.sigmoid(logits.float()) * presence_prob
+            logits = torch.logit(joint_probs.clamp(1e-6, 1 - 1e-6))
 
         if merge_cracks:
             # Step 1: Filter by score threshold
@@ -416,7 +468,8 @@ def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=2
                     pred_masks_binary.cpu(),
                     filtered_scores.cpu(),
                     filtered_boxes.cpu(),
-                    iou_threshold=merge_iou_threshold
+                    iou_threshold=merge_iou_threshold,
+                    dilate=merge_dilate
                 )
 
                 # Step 4: Top-K selection by score
@@ -470,6 +523,75 @@ def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=2
                 pred_id += 1
 
     return coco_predictions
+
+
+def compute_pixel_metrics(coco_gt_dict, coco_predictions):
+    """
+    Pixel-level (semantic) segmentation metrics per (image, prompt) unit.
+
+    Instance matching (mAP/cgF1) requires one prediction to cover one GT
+    instance at IoU >= threshold, which triple-penalizes a crack predicted as
+    several disjoint fragments (GT missed + each fragment a false positive).
+    Here we instead union all predicted masks and all GT masks per unit and
+    compare pixels, so fragmentation does not matter — only coverage does.
+    This is the standard metric in the crack-segmentation literature.
+
+    Predictions are the post-NMS/post-merge set (already score-filtered), so
+    the prob_threshold acts as the binarization threshold.
+
+    Returns dict with:
+        pixel_iou:       micro-averaged IoU (all TP/FP/FN pixels pooled)
+        pixel_precision: micro-averaged precision
+        pixel_recall:    micro-averaged recall
+        mean_unit_iou:   mean per-unit IoU over units where GT or prediction
+                         is non-empty (empty-vs-empty units are skipped)
+    """
+    from collections import defaultdict
+
+    def _decode_rle(rle):
+        rle = dict(rle)
+        if isinstance(rle.get('counts'), str):
+            rle['counts'] = rle['counts'].encode('utf-8')
+        return mask_utils.decode(rle).astype(bool)
+
+    preds_by_img = defaultdict(list)
+    for p in coco_predictions:
+        preds_by_img[p['image_id']].append(p['segmentation'])
+
+    gts_by_img = defaultdict(list)
+    for a in coco_gt_dict['annotations']:
+        if 'segmentation' in a:
+            gts_by_img[a['image_id']].append(a['segmentation'])
+
+    tp = fp = fn = 0
+    unit_ious = []
+
+    for img in coco_gt_dict['images']:
+        img_id = img['id']
+        h, w = img['height'], img['width']
+
+        gt_union = np.zeros((h, w), dtype=bool)
+        for rle in gts_by_img.get(img_id, []):
+            gt_union |= _decode_rle(rle)
+
+        pred_union = np.zeros((h, w), dtype=bool)
+        for rle in preds_by_img.get(img_id, []):
+            pred_union |= _decode_rle(rle)
+
+        inter = int(np.logical_and(gt_union, pred_union).sum())
+        union = int(np.logical_or(gt_union, pred_union).sum())
+        tp += inter
+        fp += int(pred_union.sum()) - inter
+        fn += int(gt_union.sum()) - inter
+        if union > 0:
+            unit_ious.append(inter / union)
+
+    return {
+        'pixel_iou': tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0,
+        'pixel_precision': tp / (tp + fp) if (tp + fp) > 0 else 0.0,
+        'pixel_recall': tp / (tp + fn) if (tp + fn) > 0 else 0.0,
+        'mean_unit_iou': float(np.mean(unit_ious)) if unit_ious else 0.0,
+    }
 
 
 def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
@@ -879,7 +1001,8 @@ def move_to_device(obj, device):
 
 def validate(config_path, weights_path, val_data_dir, num_samples=None,
              prob_threshold=0.3, nms_iou=0.7, merge_cracks=False, merge_iou=0.15,
-             use_base_model=False):
+             merge_dilate=0, use_base_model=False, use_presence=True,
+             pixel_metrics=True):
     """Run validation with full metrics (mAP, cgF1) and SAM3 NMS
 
     Args:
@@ -1102,11 +1225,18 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
                         'src_idx': src_idx,
                         'obj_ids': obj_ids,
                     })
-                    all_predictions.append({
+                    pred_entry = {
                         'pred_logits': final_outputs['pred_logits'][i].detach().cpu(),
                         'pred_boxes': final_outputs['pred_boxes'][i].detach().cpu(),
                         'pred_masks': final_outputs['pred_masks'][i].detach().cpu()
-                    })
+                    }
+                    # Prompt-level presence logit, needed to compute the joint
+                    # detection score the way SAM3's official eval does.
+                    if 'presence_logit_dec' in final_outputs:
+                        pred_entry['presence_logit'] = (
+                            final_outputs['presence_logit_dec'][i].detach().cpu()
+                        )
+                    all_predictions.append(pred_entry)
 
     print(f"\nCollected predictions for {len(all_predictions)} images")
 
@@ -1143,7 +1273,9 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         nms_iou_threshold=nms_iou,
         max_detections=100,
         merge_cracks=merge_cracks,
-        merge_iou_threshold=merge_iou
+        merge_iou_threshold=merge_iou,
+        merge_dilate=merge_dilate,
+        use_presence=use_presence
     )
 
     if merge_cracks:
@@ -1203,6 +1335,14 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         cgf1_50 = cgf1_results.get('cgF1_eval_segm_cgF1@0.5', 0.0)
         cgf1_75 = cgf1_results.get('cgF1_eval_segm_cgF1@0.75', 0.0)
 
+        # Compute pixel-level metrics (fragmentation-insensitive)
+        pixel_results = None
+        if pixel_metrics:
+            print("\n" + "="*80)
+            print("PIXEL-LEVEL (SEMANTIC) EVALUATION")
+            print("="*80)
+            pixel_results = compute_pixel_metrics(coco_gt_dict, coco_predictions)
+
         # Print summary
         print("\n" + "="*80)
         print("FINAL RESULTS")
@@ -1213,6 +1353,14 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         print(f"cgF1 (IoU 0.50:0.95): {cgf1:.4f}")
         print(f"cgF1@50: {cgf1_50:.4f}")
         print(f"cgF1@75: {cgf1_75:.4f}")
+        if pixel_results is not None:
+            print("-"*80)
+            print("Pixel-level metrics (union of masks per prompt; robust to")
+            print("a single crack being predicted as multiple fragments):")
+            print(f"Pixel IoU:       {pixel_results['pixel_iou']:.4f}")
+            print(f"Pixel Precision: {pixel_results['pixel_precision']:.4f}")
+            print(f"Pixel Recall:    {pixel_results['pixel_recall']:.4f}")
+            print(f"Mean per-prompt IoU: {pixel_results['mean_unit_iou']:.4f}")
         print("="*80)
 
         # Cleanup temporary files
@@ -1282,12 +1430,39 @@ if __name__ == "__main__":
         default=0.15,
         help="IoU threshold for merging overlapping predictions (default: 0.15, lower = more aggressive)"
     )
+    parser.add_argument(
+        "--merge-dilate",
+        type=int,
+        default=0,
+        help="Dilation radius in pixels (at 288 mask resolution) for --merge: "
+             "disjoint fragments within ~2x this distance are joined into ONE "
+             "instance before matching. Fixes a single GT crack predicted as "
+             "several portions. 0 disables (default). Try 3-5 for cracks. "
+             "Requires --merge."
+    )
+    parser.add_argument(
+        "--pixel-metrics",
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=True,
+        help="Also report pixel-level (semantic) IoU/precision/recall computed "
+             "on the union of masks per prompt — insensitive to a crack being "
+             "split into multiple predicted fragments: True or False (default: True)"
+    )
+    parser.add_argument(
+        "--no-presence",
+        action="store_true",
+        help="Score with raw pred_logits instead of multiplying in the presence "
+             "score. SAM3's official eval uses presence; disabling it makes the "
+             "zero-shot baseline collapse to ~0 mAP."
+    )
     args = parser.parse_args()
 
     # Validate argument combinations
     if not args.use_base_model:
         if args.config is None or args.weights is None:
             parser.error("--config and --weights are required when not using --use-base-model")
+    if args.merge_dilate > 0 and not args.merge:
+        parser.error("--merge-dilate requires --merge (dilation only applies in merging mode)")
 
     validate(
         config_path=args.config,
@@ -1298,5 +1473,8 @@ if __name__ == "__main__":
         nms_iou=args.nms_iou,
         merge_cracks=args.merge,
         merge_iou=args.merge_iou,
-        use_base_model=args.use_base_model
+        merge_dilate=args.merge_dilate,
+        use_base_model=args.use_base_model,
+        use_presence=not args.no_presence,
+        pixel_metrics=args.pixel_metrics
     )
