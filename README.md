@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://github.com/Sompote/SAM3_LoRA)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/Sompote/SAM3_LoRA)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
@@ -20,6 +20,13 @@
 Fine-tune SAM3 (Segment Anything Model 3) on your own dataset using **LoRA (Low-Rank Adaptation)** — a parameter-efficient method that reduces trainable parameters from 100% to ~1% while maintaining performance. Train on a standard COCO-format dataset with text prompts taken from your category names, while preserving SAM3's open-vocabulary behavior: the fine-tuned model segments your target classes (e.g. `crack`, `hole`) and still returns **nothing** for unrelated prompts (e.g. `car`).
 
 ### Recent Updates
+
+**2026-08-01 (v0.3.0)**:
+- **Guaranteed cross-class hard negatives** — negatives are now two-tier: every dataset category absent from an image is **always** added as a must-return-nothing prompt (previously it was only randomly sampled, far too rare to separate confusable classes like `crack` vs `water ingress` — all prompts ended up segmenting the same defect). `num_negatives` now controls only the extra generic out-of-domain prompts sampled per image. Generic negatives that share a word with a dataset category (e.g. `water` vs `water ingress`) are removed automatically — training them to return nothing contradicts the related positive class. See [Preserving prompt discrimination](#preserving-prompt-discrimination-important)
+- **Fixed baseline validation scoring ~0 mAP** — `validate_sam3_lora.py` scored detections with raw `pred_logits` only, but SAM3's image model keeps the **presence score** separate (the official `PostProcessImage` multiplies it in). Without it, the zero-shot baseline floods every prompt with confident false detections and its mAP collapses to 0. Validation now uses the joint score `sigmoid(logit) × sigmoid(presence)` by default (`--no-presence` restores the old behavior). LoRA numbers also change slightly — rerun both sides for a fair comparison
+- **New: pixel-level metrics** (`--pixel-metrics`, default on) — reports semantic IoU / precision / recall on the union of masks per prompt, alongside mAP/cgF1. Instance matching triple-penalizes a single GT crack predicted as several fragments (missed GT + each fragment a false positive); pixel metrics measure coverage regardless of fragmentation. See [Fragmented predictions](#fragmented-predictions-and-pixel-level-metrics-cracks)
+- **New: proximity merging** (`--merge-dilate N`) — `--merge` only fused *overlapping* fragments (disjoint crack portions have mask IoU 0 and never merged). With a dilation radius, fragments whose dilated masks touch are joined into one instance before matching
+- **New: box/score display options in evaluation scripts** — `compare_lora_base.py` / `compare_lora_base_batch.py` gain `--boundingbox True/False` and `--score True/False` (per-detection confidence labels, no boxes required); `infer_sam.py` gains `--score` so confidence shows independently of `--boundingbox`
 
 **2026-07-05 (v0.2.0)**:
 - **Fixed loss of prompt discrimination after fine-tuning** — previously the model detected trained objects regardless of the text prompt (e.g. segmenting cracks when prompted `car`). Root cause: positive-only training queries. See [Preserving prompt discrimination](#preserving-prompt-discrimination-important)
@@ -357,16 +364,23 @@ the text condition and learns to "always fire."
 
 Two settings fix this:
 
-1. **Hard-negative text queries** (`num_negatives` in the training config). For
-   each image the dataloader adds prompts that must return **nothing** — other
-   dataset categories plus a generic out-of-domain pool (`car`, `person`,
-   `dog`, …). This restores the model's ability to say "this prompt matches
-   nothing here." `2`–`4` works well; `0` disables it. The shipped configs set
-   `3`; if the key is absent the trainers default to `2`.
+1. **Hard-negative text queries** — prompts that must return **nothing** for an
+   image. The dataloader adds them in two tiers:
+
+   - **In-domain negatives (always added).** Every dataset category absent from
+     an image becomes a zero-detection query on that image. These are the
+     confusable prompts — on a water-ingress image, `crack` and
+     `concrete spalling` are told to return nothing, every single epoch. When
+     these were only randomly sampled, the signal was too rare for the model to
+     keep visually similar classes apart: after fine-tuning, all three prompts
+     segmented the same defect.
+   - **Generic out-of-domain negatives (sampled).** `num_negatives` prompts per
+     image drawn from a built-in pool (`car`, `person`, `dog`, …). `2`–`4`
+     works well; `0` disables this tier only. The shipped configs set `3`.
 
    ```yaml
    training:
-     num_negatives: 3
+     num_negatives: 3   # generic tier only; absent dataset categories are always added
    ```
 
    If a concept from the default generic pool can genuinely appear in your
@@ -378,6 +392,11 @@ Two settings fix this:
    training:
      generic_negatives: ["car", "person", "dog", "bicycle", "bottle"]
    ```
+
+   Pool entries that share a word with one of your dataset categories are
+   removed automatically (e.g. `water` is dropped when a category is named
+   `water ingress`) — training `water` to return nothing on images full of
+   water ingress would contradict the positive class.
 
 2. **Keep the text encoder frozen** (`apply_to_text_encoder: false`). Adapting
    the text encoder distorts SAM3's text↔image alignment — the very thing that
@@ -614,6 +633,15 @@ python3 validate_sam3_lora.py \
   --use-base-model
 ```
 
+> **Presence scoring (v0.3.0):** detections are ranked by the joint score
+> `sigmoid(pred_logit) × sigmoid(presence_logit)`, matching SAM3's official
+> `PostProcessImage`. This matters most for the `--use-base-model` baseline:
+> the pretrained model's raw query logits are confident even for absent
+> concepts, and scoring them alone floods the eval with false positives
+> (baseline mAP reads as 0.0000). If your baseline scored ~0 with an older
+> version, rerun — and rerun the LoRA side too, since the scoring change
+> applies to both. `--no-presence` restores the old raw-logit behavior.
+
 **Expected Output:**
 ```
 Running SAM3 LoRA Validation
@@ -641,6 +669,13 @@ Category-agnostic F1 Scores:
   cgF1 (avg):          0.135
   cgF1@50:             0.149
   cgF1@75:             0.089
+--------------------------------------------------------------------------------
+Pixel-level metrics (union of masks per prompt; robust to
+a single crack being predicted as multiple fragments):
+  Pixel IoU:       0.412
+  Pixel Precision: 0.573
+  Pixel Recall:    0.598
+  Mean per-prompt IoU: 0.387
 ================================================================================
 ```
 
@@ -674,11 +709,51 @@ they read like natural concepts (e.g. `"deep crack"`, not `"class_2"`).
 | **cgF1** | Concept-level F1 (SAM3's primary metric) | > 0.25 | > 0.50 |
 | **cgF1@50** | cgF1 at IoU 0.50 | > 0.30 | > 0.60 |
 | **cgF1@75** | cgF1 at IoU 0.75 | > 0.15 | > 0.35 |
+| **Pixel IoU** | Semantic IoU on the union of masks per prompt | > 0.40 | > 0.60 |
 
 **Understanding the Metrics:**
 - **mAP**: Standard COCO metric - higher is better, penalizes over/under-segmentation
 - **cgF1**: SAM3's concept-level metric - balances precision and recall for concepts, not individual instances
 - **@50/@75**: Different IoU thresholds (50% overlap vs 75% overlap)
+- **Pixel IoU / Precision / Recall**: instance-free coverage metrics — see the next section
+
+### Fragmented predictions and pixel-level metrics (cracks)
+
+Instance matching (mAP, cgF1) requires **one prediction** to cover **one GT
+instance** at IoU ≥ threshold. That triple-penalizes a common crack failure
+mode: the model predicts one GT crack as two disjoint portions. Each portion's
+IoU against the full GT is at best ~0.5 (intersection is only its own pixels,
+union is the whole crack), so typically the GT counts as **missed** *and* both
+portions count as **false positives** — even though together they cover the
+crack well. This is a large part of why mAP@75 is much lower than mAP@50 for
+thin structures.
+
+Two tools address this:
+
+1. **Pixel-level metrics** (`--pixel-metrics`, on by default) — per
+   (image, prompt) unit, all predicted masks are unioned and compared
+   pixel-by-pixel against the union of GT masks. Fragmentation doesn't matter,
+   only coverage does; this is the standard metric in the crack-segmentation
+   literature. A large gap between Pixel IoU and mAP@50 tells you the model
+   *finds* the cracks but *splits* them.
+
+2. **Proximity merging** (`--merge --merge-dilate N`) — plain `--merge` only
+   fuses *overlapping* fragments (disjoint portions have mask IoU 0 with each
+   other and are never merged). With `--merge-dilate N`, masks are dilated by
+   N pixels and fragments whose dilated masks **touch** are joined into a
+   single instance (the output keeps the original undilated union), which then
+   matches the GT as one prediction. N is in pixels at the 288×288 mask
+   resolution; `3`–`5` works well for cracks (N=4 bridges gaps up to ~8 px at
+   288, roughly 28 px at 1008).
+
+```bash
+python3 validate_sam3_lora.py \
+  --config configs/full_lora_config.yaml \
+  --weights outputs/sam3_lora_full/best_lora_weights.pt \
+  --val_data_dir /workspace/data2/valid \
+  --merge --merge-dilate 4 \
+  --pixel-metrics True
+```
 
 ### Advanced Validation Options
 
@@ -755,6 +830,9 @@ python3 validate_sam3_lora.py \
 | `--nms-iou` | 0.7 | NMS IoU threshold | Lower for fewer duplicates (0.5), higher to keep overlaps (0.8) |
 | `--merge` | False | Enable segment merging | Use for crack-like or connected objects |
 | `--merge-iou` | 0.15 | IoU threshold for merging | Lower for aggressive merging (0.05), higher for conservative (0.25) |
+| `--merge-dilate` | 0 | Dilation radius (px at 288) to join disjoint fragments | 3-5 for cracks split into portions; requires `--merge` |
+| `--pixel-metrics` | True | Report pixel-level IoU/precision/recall | Disable with `False` if you only want instance metrics |
+| `--no-presence` | False | Score with raw logits (skip presence score) | Only to reproduce pre-v0.3.0 numbers |
 | `--use-base-model` | False | Use original SAM3 (no LoRA) | For baseline comparison |
 
 ### Interpreting Results
@@ -1716,7 +1794,7 @@ If you use this work, please cite:
   title = {SAM3-LoRA: Low-Rank Adaptation for Fine-Tuning},
   author = {AI Research Group, KMUTT},
   year = {2026},
-  version = {0.2.0},
+  version = {0.3.0},
   organization = {King Mongkut's University of Technology Thonburi},
   url = {https://github.com/Sompote/SAM3_LoRA}
 }
@@ -1745,7 +1823,7 @@ This project is licensed under Apache 2.0. See [LICENSE](LICENSE) for details.
 
 <div align="center">
 
-**Version**: 0.2.0
+**Version**: 0.3.0
 **Python**: 3.8+
 **PyTorch**: 2.0+
 
