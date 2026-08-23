@@ -76,6 +76,42 @@ training:
   #   out-of-domain negative pool if a default concept can appear in your images.
   #   (Pool entries sharing a word with a dataset category are auto-removed.)
 
+  # ---------------------------------------------------------------------
+  # Data format and text prompts
+  # ---------------------------------------------------------------------
+  # "coco" (default) reads <data_dir>/<split>/_annotations.coco.json.
+  # "odvg" reads <data_dir>/<split>/_annotations.odvg.jsonl (Grounding-DINO
+  #   ODVG: one JSON object per line, a phrase per region). Convert an existing
+  #   COCO export with:  python3 convert_coco_to_odvg.py --data-dir <data_dir>
+  data_format: "coco"
+
+  # --- coco format only ---
+  # Where the text prompt comes from. "auto" takes the first available of:
+  #   annotation["caption"|"description"|"text"]   per SEGMENT
+  #   image["caption"|"description"]               per IMAGE
+  #   category["description"|"caption"]            per CLASS (RF100-VL style)
+  #   category["name"]                             class name
+  # Descriptions can also live in a _descriptions.json sidecar next to the
+  # annotations, so a Roboflow re-export never overwrites them.
+  # Force one level with: caption | image_caption | category_description
+  # Restore the pre-description behavior with: category_name
+  prompt_source: "auto"
+  # Also emit the plain class-name query alongside the description, so the tuned
+  # model answers to both "crack" and "long diagonal crack near the ledge".
+  # Roughly doubles the queries per image.
+  mix_class_prompt: false
+
+  # --- odvg format only ---
+  # Emit an extra whole-image query for grounding.caption targeting every region
+  # it grounds, on top of the per-region phrase queries.
+  use_full_caption: true
+  # odvg_annotations_file: "_annotations.odvg.jsonl"
+
+  # In-domain negatives sampled per image once the prompt corpus exceeds 50
+  # distinct texts (what happens with per-segment descriptions). Below that
+  # threshold every absent prompt is used, as before.
+  num_cross_negatives: 2
+
   learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
   weight_decay: 0.01
   adam_beta1: 0.9

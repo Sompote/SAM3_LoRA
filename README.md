@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/Sompote/SAM3_LoRA)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/Sompote/SAM3_LoRA)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
@@ -20,6 +20,14 @@
 Fine-tune SAM3 (Segment Anything Model 3) on your own dataset using **LoRA (Low-Rank Adaptation)** — a parameter-efficient method that reduces trainable parameters from 100% to ~1% while maintaining performance. Train on a standard COCO-format dataset with text prompts taken from your category names, while preserving SAM3's open-vocabulary behavior: the fine-tuned model segments your target classes (e.g. `crack`, `hole`) and still returns **nothing** for unrelated prompts (e.g. `car`).
 
 ### Recent Updates
+
+**2026-08-23 (v0.4.0)**:
+- **Train on descriptions, not just class names** — the text prompt no longer has to be the COCO category name. Two data formats, selected with `training.data_format`:
+  - `coco` (default) — the same `_annotations.coco.json` you already have, now resolving prompts from `annotation["caption"]` (per **segment**) → `image["caption"]` (per **image**) → `category["description"]` (per **class**, RF100-VL style) → `category["name"]`. An unmodified export behaves exactly as before. Descriptions may also live in a `_descriptions.json` sidecar so Roboflow re-exports never overwrite them. `prompt_source` forces one level; `mix_class_prompt` trains the bare class name as a second prompt alongside the description
+  - `odvg` — Grounding-DINO ODVG jsonl, a phrase per region plus a whole-image `grounding.caption`. Masks (`segmentation`/`mask`, polygon or RLE) and detection-mode lines are supported; identical phrases within an image are grouped into one multi-target query
+- **New: `convert_coco_to_odvg.py`** — Roboflow has no ODVG export, so this converts a COCO split to `_annotations.odvg.jsonl`, preserving masks and emitting `tokens_positive` wherever a phrase occurs verbatim in the caption
+- **Negative sampling adapts to the prompt corpus** — with class names every absent prompt is still always a negative; past 50 distinct prompts (what per-segment descriptions produce) `num_cross_negatives` are sampled per image instead, so one image no longer generates thousands of queries
+- **Fixed object/text misalignment in the COCO loader** — an annotation skipped for an unreadable mask still appended its class name, shifting every later object's text onto the wrong instance. Text is now appended with the object it belongs to. See [Training on descriptions](#training-on-descriptions-not-just-class-names)
 
 **2026-08-01 (v0.3.0)**:
 - **Guaranteed cross-class hard negatives** — negatives are now two-tier: every dataset category absent from an image is **always** added as a must-return-nothing prompt (previously it was only randomly sampled, far too rare to separate confusable classes like `crack` vs `water ingress` — all prompts ended up segmenting the same defect). `num_negatives` now controls only the extra generic out-of-domain prompts sampled per image. Generic negatives that share a word with a dataset category (e.g. `water` vs `water ingress`) are removed automatically — training them to return nothing contradicts the related positive class. See [Preserving prompt discrimination](#preserving-prompt-discrimination-important)
@@ -251,6 +259,422 @@ exactly the one instance it refers to — true referring segmentation; keep
 `--mode category` ignores the expressions and produces plain class-level
 detection data from the original COCO categories. Use `--symlink` to link
 images instead of copying.
+
+---
+
+#### Training on descriptions, not just class names
+
+By default the text prompt SAM3 trains on is the **category name** (`crack`).
+Two data formats let you train on a real **description** instead. Pick one with
+`training.data_format`:
+
+| `data_format` | File | Text lives in | Best when |
+|---------------|------|---------------|-----------|
+| `coco` *(default)* | `_annotations.coco.json` | `caption` / `description` fields, or a `_descriptions.json` sidecar | You already have a Roboflow/COCO export and want to add text to it |
+| `odvg` | `_annotations.odvg.jsonl` | a `phrase` per region + a whole-image `caption` | Descriptions are phrases cut from one sentence about the image |
+
+An **unmodified export keeps working exactly as before** — no text found means
+the class name is used, same as every previous version.
+
+<details>
+<summary><b>Format 1 — <code>coco</code>: descriptions inside your COCO file</b> &nbsp;<i>(default, click to expand)</i></summary>
+
+<br>
+
+Same folder layout as above. The prompt for each annotation is resolved in this
+order, **first hit wins**:
+
+| # | Where the text is read from | Grain |
+|---|------------------------------|-------|
+| 1 | `annotation["caption"]` &rarr; `["description"]` &rarr; `["text"]` &rarr; `["phrase"]` &rarr; `["expression"]` | per **segment** |
+| 2 | `image["caption"]` &rarr; `["description"]` &rarr; `["text"]` | per **image** |
+| 3 | `category["description"]` &rarr; `["caption"]` &rarr; `["instructions"]` &rarr; `["prompt"]` | per **class** (RF100-VL style) |
+| 4 | `category["name"]` | class name *(fallback)* |
+
+##### How to format your data
+
+**Option A — per class** *(easiest; one sentence per class, whole dataset)*
+
+Add `description` to each entry in `categories`. Nothing else changes:
+
+```json
+{
+  "categories": [
+    {"id": 1, "name": "crack",
+     "description": "a long thin fracture in the concrete surface"},
+    {"id": 2, "name": "spall",
+     "description": "a shallow patch where concrete has flaked away"}
+  ]
+}
+```
+
+**Option B — per image** *(one sentence per picture, applies to all its objects)*
+
+Add `caption` to each entry in `images`:
+
+```json
+{
+  "images": [
+    {"id": 0, "file_name": "pier_07.jpg", "height": 480, "width": 640,
+     "caption": "cracks on a weathered concrete bridge pier"}
+  ]
+}
+```
+
+**Option C — per segment** *(most precise; a referring expression per mask)*
+
+Add `caption` to each entry in `annotations`. Each mask gets its own sentence,
+and each sentence trains to return only that one instance:
+
+```json
+{
+  "annotations": [
+    {"id": 1, "image_id": 0, "category_id": 1,
+     "bbox": [120, 84, 210, 46],
+     "segmentation": [[x1, y1, x2, y2, "..."]],
+     "caption": "long diagonal crack near the ledge"},
+    {"id": 2, "image_id": 0, "category_id": 1,
+     "bbox": [40, 300, 60, 22],
+     "segmentation": [[x1, y1, x2, y2, "..."]],
+     "caption": "hairline crack at the slab edge"}
+  ]
+}
+```
+
+You can mix all three in one file — level 1 wins where it exists, level 2 fills
+the gaps, level 3 catches the rest.
+
+**Option D — the `_descriptions.json` sidecar** *(recommended if you re-export)*
+
+Roboflow overwrites `_annotations.coco.json` every time you export. Put the text
+in a sidecar next to it instead and it survives:
+
+```
+data/train/
+├── img001.jpg
+├── _annotations.coco.json     # Roboflow writes this — never edited
+└── _descriptions.json         # yours
+```
+
+```json
+{
+  "by_annotation": {"1": "long diagonal crack near the ledge"},
+  "by_image":      {"pier_07.jpg": "cracks on a concrete bridge pier"},
+  "by_category":   {"crack": "a long thin fracture in the concrete surface"}
+}
+```
+
+All three blocks are optional. `by_annotation` is keyed by COCO annotation
+`id`; `by_image` accepts either the file name or the image `id`; `by_category`
+is keyed by lowercase class name. **Sidecar entries beat inline JSON fields at
+the same level.**
+
+##### Config
+
+```yaml
+training:
+  data_format: "coco"
+  prompt_source: "auto"        # auto | caption | image_caption
+                               # | category_description | category_name
+  mix_class_prompt: false      # also train the bare class name as a 2nd prompt
+```
+
+`prompt_source: "auto"` walks the table above. Force a single level with
+`caption`, `image_caption` or `category_description` — those still fall back to
+the class name where that level is missing, so a partially-described dataset
+never trains on an empty prompt. `category_name` restores the old behavior
+outright.
+
+`mix_class_prompt: true` emits **both** queries per object — the description
+*and* the bare class name — so the tuned model answers to `crack` as well as
+`long diagonal crack near the ledge`. It roughly doubles the queries per image,
+and therefore the step time.
+
+##### What the trainer actually builds
+
+For an image with two `crack` annotations, the first captioned and the second
+not, with a per-image caption present, `prompt_source: auto` produces:
+
+```
+  1 target   <- 'long diagonal crack near the ledge'      # ann 1, its own caption
+  1 target   <- 'cracks on a weathered concrete pier'     # ann 2, image fallback
+  0 targets  <- 'spall'                                   # absent class -> negative
+  0 targets  <- 'car'                                     # generic negative
+```
+
+Objects sharing a prompt are grouped into **one query with several targets**,
+not competing single-target queries.
+
+</details>
+
+<details>
+<summary><b>Format 2 — <code>odvg</code>: Grounding-DINO ODVG jsonl</b> &nbsp;<i>(click to expand)</i></summary>
+
+<br>
+
+`<data_dir>/<split>/_annotations.odvg.jsonl` — one JSON object per line, images
+in the same directory. Each region carries **its own phrase**, and
+`grounding.caption` is the sentence those phrases were cut from;
+`tokens_positive` records where in that sentence each phrase sits.
+
+```json
+{"filename": "pier_07.jpg", "height": 693, "width": 1024,
+ "grounding": {
+   "caption": "a long diagonal crack under the ledge and rust below it",
+   "regions": [
+     {"phrase": "a long diagonal crack under the ledge",
+      "bbox": [20, 215, 985, 665],
+      "tokens_positive": [[0, 37]],
+      "segmentation": [[20, 215, 985, 215, 985, 665, 20, 665]]},
+     {"phrase": "rust",
+      "bbox": [412, 588, 690, 672],
+      "tokens_positive": [[46, 50]],
+      "segmentation": {"counts": "...", "size": [693, 1024]}}
+   ]}}
+```
+
+##### Field reference
+
+| Field | Required | Notes |
+|-------|----------|-------|
+| `filename` | yes | Relative to the split directory |
+| `height`, `width` | no | Falls back to the image on disk |
+| `grounding.caption` | no | Whole-image sentence; trained as an extra query when `use_full_caption` is on |
+| `grounding.regions[].phrase` | yes | The per-segment text. `caption` / `category` / `text` also accepted |
+| `grounding.regions[].bbox` | yes | **Absolute `[x1, y1, x2, y2]`** — note COCO uses `[x, y, w, h]` |
+| `grounding.regions[].segmentation` | no | Polygon list or RLE dict. `mask` accepted as an alias. Without it the sample trains boxes only |
+| `grounding.regions[].tokens_positive` | no | Char spans into `caption`. Read for provenance; not required by the trainer |
+| `detection.instances[]` | — | Detection-mode alternative to `grounding.regions`; `category` is used as the phrase |
+
+##### How to format your data
+
+**Option A — convert an existing COCO export** *(recommended)*
+
+Roboflow has no ODVG export, so this bridges the gap. Masks are preserved and
+`tokens_positive` is emitted wherever a phrase occurs verbatim in the caption:
+
+```bash
+# every split under a dataset root
+python3 convert_coco_to_odvg.py --data-dir data/crack
+
+# a single split
+python3 convert_coco_to_odvg.py --split-dir data/crack/train
+
+# boxes only, drop masks
+python3 convert_coco_to_odvg.py --data-dir data/crack --no-masks
+
+# omit images with no annotations instead of keeping them as caption-only rows
+python3 convert_coco_to_odvg.py --data-dir data/crack --skip-empty
+```
+
+The converter reads text with the same resolution order as Format 1
+(`annotation` &rarr; `category` description &rarr; class name), honours
+`_descriptions.json`, and synthesizes `grounding.caption` by joining the
+distinct phrases when an image has no caption of its own.
+
+**Option B — write it yourself**
+
+One `json.dumps(...)` per line, no wrapping array, no trailing comma:
+
+```python
+import json
+
+with open("data/crack/train/_annotations.odvg.jsonl", "w") as f:
+    for sample in my_samples:
+        f.write(json.dumps({
+            "filename": sample.file_name,
+            "height": sample.height,
+            "width": sample.width,
+            "grounding": {
+                "caption": sample.sentence,
+                "regions": [
+                    {"phrase": r.phrase,
+                     "bbox": [r.x1, r.y1, r.x2, r.y2],       # absolute xyxy
+                     "segmentation": r.polygon}              # [[x1,y1,x2,y2,...]]
+                    for r in sample.regions
+                ],
+            },
+        }) + "\n")
+```
+
+**Option C — detection mode** *(class-level, no sentence)*
+
+```json
+{"filename": "pier_07.jpg", "height": 693, "width": 1024,
+ "detection": {"instances": [
+   {"bbox": [20, 215, 985, 665], "label": 0, "category": "crack",
+    "mask": {"counts": "...", "size": [693, 1024]}}]}}
+```
+
+##### Config
+
+```yaml
+training:
+  data_format: "odvg"
+  use_full_caption: true                            # extra whole-image query
+  # odvg_annotations_file: "_annotations.odvg.jsonl"
+```
+
+##### What the trainer actually builds
+
+For the `pier_07.jpg` line above, plus a third region also phrased `rust`:
+
+```
+  1 target   <- 'a long diagonal crack under the ledge'
+  2 targets  <- 'rust'                                     # both regions, one query
+  3 targets  <- 'a long diagonal crack under the ledge and rust below it'
+  0 targets  <- 'spall'                                    # phrase from another image
+```
+
+Regions sharing a phrase within one image are **grouped into a single
+multi-target query** rather than competing single-target ones. With
+`use_full_caption: true` (default) the whole-image sentence becomes an extra
+query targeting every region it grounds — so you train the sentence and its
+constituent phrases from one annotation.
+
+</details>
+
+<details>
+<summary><b>Which granularity should I use?</b></summary>
+
+<br>
+
+| | Per class | Per image | Per segment |
+|---|-----------|-----------|-------------|
+| Effort | one line per class | one line per image | one line per mask |
+| Distinct prompts | = number of classes | ≈ number of images | ≈ number of masks |
+| Model learns | a richer definition of each class | what this scene contains | which *specific* instance a sentence means |
+| Negatives | every absent class, always | sampled *(see below)* | sampled *(see below)* |
+| Closest to | RF100-VL labeling instructions | image captioning | RefCOCO / referring segmentation |
+| Use when | class names are ambiguous (`defect`, `type 2`) | scenes differ more than objects do | several instances of one class must be told apart |
+
+If you only want *"this mask means this sentence"*, **per segment** is the one.
+If your class names are just terse (`crack` for what is really a fracture in
+concrete), **per class** gets most of the benefit for a fraction of the work.
+
+</details>
+
+<details>
+<summary><b>How hard negatives work with free text</b></summary>
+
+<br>
+
+The [two-tier negative scheme](#preserving-prompt-discrimination-important) still
+applies, but the in-domain tier adapts to how many distinct prompts exist:
+
+| Prompt corpus | In-domain negatives per image |
+|---------------|-------------------------------|
+| ≤ 50 distinct texts *(class names, per-class descriptions)* | **every** absent prompt, always — unchanged behavior |
+| > 50 distinct texts *(per-image, per-segment descriptions)* | `num_cross_negatives` sampled per image (default 2) |
+
+Without that switch a per-segment dataset would emit one negative query per
+*other caption in the split* — thousands per image. The generic out-of-domain
+tier (`num_negatives`) is unaffected, and pool entries sharing a word with any
+positive prompt are still removed automatically.
+
+```yaml
+training:
+  num_negatives: 3          # generic out-of-domain prompts per image
+  num_cross_negatives: 2    # in-domain prompts sampled once the corpus is large
+```
+
+Raise `num_cross_negatives` if the tuned model starts firing on the wrong
+description; lower it if step time is the constraint.
+
+</details>
+
+<details>
+<summary><b>Writing descriptions that actually help</b></summary>
+
+<br>
+
+SAM3 was pretrained on **short noun phrases**, not sentences. Its text encoder
+is frozen by default here, so descriptions that drift far from that distribution
+train poorly.
+
+**Do**
+
+- Keep it to a noun phrase: `long diagonal crack near the ledge`
+- Lead with the object, qualify after: `crack running under the window ledge`
+- Use words that distinguish instances if that is what you need to teach:
+  `crack on the left pier` vs `crack on the right pier`
+- Stay consistent — the same defect should get the same phrasing across images
+
+**Avoid**
+
+- Full sentences with verbs and articles: `There is a crack that runs...`
+- Instructions or meta text: `annotate any crack wider than 2mm`
+- Very long strings — they get truncated by the text encoder
+- Phrases that contradict a negative: if `water` is in the generic negative
+  pool and your class is `water ingress`, the pool entry is dropped
+  automatically, but hand-written `generic_negatives` are not checked as
+  thoroughly
+
+</details>
+
+<details>
+<summary><b>Config key reference</b></summary>
+
+<br>
+
+All under `training:` in your YAML config.
+
+| Key | Default | Applies to | Meaning |
+|-----|---------|------------|---------|
+| `data_format` | `"coco"` | both | `coco` or `odvg` |
+| `prompt_source` | `"auto"` | coco | `auto` \| `caption` \| `image_caption` \| `category_description` \| `category_name` |
+| `mix_class_prompt` | `false` | coco | Also emit the bare class-name query alongside the description |
+| `use_full_caption` | `true` | odvg | Emit an extra whole-image query for `grounding.caption` |
+| `odvg_annotations_file` | `"_annotations.odvg.jsonl"` | odvg | Override the jsonl filename |
+| `num_cross_negatives` | `2` | both | In-domain negatives sampled per image once the corpus exceeds 50 distinct prompts |
+| `num_negatives` | `2` | both | Generic out-of-domain negatives sampled per image |
+| `generic_negatives` | built-in pool | both | Replace the out-of-domain pool |
+
+</details>
+
+<details>
+<summary><b>Check your data before starting a long run</b></summary>
+
+<br>
+
+Load one sample and print the queries the trainer will actually see:
+
+```python
+# COCO format
+from train_sam3_lora_native import COCOSegmentDataset
+ds = COCOSegmentDataset(data_dir="data", split="train")
+
+# ODVG format
+# from dataset_formats import ODVGDataset
+# ds = ODVGDataset(data_dir="data", split="train")
+
+dp = ds[0]
+for q in dp.find_queries:
+    print(f"{len(q.object_ids_output):3d} targets  <- {q.query_text!r}")
+```
+
+The loader also prints a summary when it starts:
+
+```
+Loaded COCO dataset: train split
+  Images: 412
+  Annotations: 1038
+  Categories: {1: 'crack', 2: 'spall'}
+  Prompt source: auto (descriptions found)
+  Distinct prompts: 1038
+  Prompt corpus > 50: sampling 2 cross-prompt negatives per image
+```
+
+`Prompt source: ... (class names)` means **no descriptions were found** and it
+is training on category names — check your field names against the resolution
+order above.
+
+</details>
+
+> **Note**: `validate_sam3_lora.py` still prompts with **category names**. If
+> you train on per-segment or per-image descriptions, its mAP/cgF1 numbers
+> measure the class-name prompt, not the descriptions. Training-time validation
+> loss (computed by the trainer) does use the same prompts as training.
 
 ### 2. Train Your Model
 
@@ -1464,7 +1888,9 @@ SAM3_LoRA/
 │   ├── train/
 │   │   ├── img001.jpg             # Training images
 │   │   ├── img002.jpg
-│   │   └── _annotations.coco.json # COCO annotations
+│   │   ├── _annotations.coco.json # COCO annotations
+│   │   ├── _annotations.odvg.jsonl # ODVG jsonl (only for data_format: odvg)
+│   │   └── _descriptions.json     # Optional description sidecar
 │   ├── valid/
 │   │   ├── img001.jpg             # Validation images
 │   │   ├── img002.jpg
@@ -1478,6 +1904,7 @@ SAM3_LoRA/
 │       └── last_lora_weights.pt   # Last epoch model
 ├── sam3/                          # SAM3 model library
 ├── lora_layers.py                 # LoRA implementation
+├── dataset_formats.py             # Text-prompt dataset formats (descriptions, ODVG)
 ├── train_sam3_lora_native.py      # Training script (computes validation loss only)
 ├── train_sam3_lora_with_categories.py  # Alternative trainer (category-focused)
 ├── validate_sam3_lora.py          # Full evaluation script (mAP, cgF1, NMS)
@@ -1486,6 +1913,7 @@ SAM3_LoRA/
 ├── inference_lora.py              # Legacy inference script
 ├── merge_lora_weights.py          # Fold a trained adapter into the base weights
 ├── convert_refcoco_to_coco.py     # RefCOCO/RRSIS-D -> COCO layout converter
+├── convert_coco_to_odvg.py        # COCO/Roboflow -> ODVG jsonl converter
 ├── README_INFERENCE.md            # Detailed inference guide
 └── README.md                      # This file
 ```

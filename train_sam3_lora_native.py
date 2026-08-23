@@ -25,7 +25,6 @@ import os
 import argparse
 import yaml
 import json
-import random
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -48,9 +47,22 @@ from sam3.train.loss.loss_fns import IABCEMdetr, Boxes, Masks, CORE_LOSS_KEY
 from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
-from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
+from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object
 from sam3.model.box_ops import box_xywh_to_xyxy
 from lora_layers import LoRAConfig, apply_lora_to_model, save_lora_weights, count_parameters
+from dataset_formats import (
+    ANNOTATION_TEXT_KEYS,
+    CATEGORY_TEXT_KEYS,
+    IMAGE_TEXT_KEYS,
+    MAX_ALWAYS_NEGATIVES,
+    ODVGDataset,
+    PROMPT_SOURCES,
+    build_negative_queries,
+    filter_generic_negatives,
+    first_text,
+    load_descriptions_sidecar,
+    make_query,
+)
 
 from torchvision.transforms import v2
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
@@ -109,7 +121,22 @@ def print_rank0(*args, **kwargs):
 
 
 class COCOSegmentDataset(Dataset):
-    """Dataset class for COCO format segmentation data"""
+    """
+    COCO-format segmentation data with optional text descriptions.
+
+    The text prompt for each annotation is resolved in this order (first hit
+    wins), so a plain Roboflow export keeps behaving exactly as before while a
+    described dataset trains on its descriptions instead:
+
+        annotation["caption"|"description"|"text"]   per SEGMENT
+        image["caption"|"description"]               per IMAGE
+        category["description"|"caption"]            per CLASS (RF100-VL style)
+        category["name"]                             class name (default)
+
+    Descriptions may also come from a `_descriptions.json` sidecar in the split
+    directory, so re-exporting from Roboflow never overwrites them. See
+    dataset_formats.load_descriptions_sidecar for its schema.
+    """
 
     # Generic out-of-domain concepts used as additional hard negatives, so the
     # model learns to NOT fire on unrelated prompts (e.g. 'car' on a crack set).
@@ -120,7 +147,8 @@ class COCOSegmentDataset(Dataset):
     ]
 
     def __init__(self, data_dir, split="train", num_negatives=2,
-                 generic_negatives=None):
+                 generic_negatives=None, prompt_source="auto",
+                 mix_class_prompt=False, num_cross_negatives=2):
         """
         Args:
             data_dir: Root directory containing train/valid/test folders
@@ -132,11 +160,31 @@ class COCOSegmentDataset(Dataset):
                 ingress') get negative supervision on every image. 0 disables
                 only the generic tier.
             generic_negatives: Optional list of out-of-domain negative concepts.
+            prompt_source: Where the text prompt comes from. 'auto' walks the
+                resolution order in the class docstring; 'caption',
+                'image_caption' and 'category_description' force one level and
+                fall back to the class name only where that level is missing;
+                'category_name' restores the pre-description behavior.
+            mix_class_prompt: Also emit the plain class-name query alongside the
+                description, so the model learns both the short concept and the
+                long phrasing. Roughly doubles the queries per image.
+            num_cross_negatives: In-domain negatives sampled per image once the
+                prompt corpus exceeds MAX_ALWAYS_NEGATIVES distinct texts (which
+                is what happens with per-segment descriptions). Below that
+                threshold every absent prompt is used, as before.
         """
+        if prompt_source not in PROMPT_SOURCES:
+            raise ValueError(
+                f"prompt_source must be one of {PROMPT_SOURCES}, got {prompt_source!r}"
+            )
+
         self.data_dir = Path(data_dir)
         self.split = split
         self.split_dir = self.data_dir / split
         self.num_negatives = num_negatives
+        self.prompt_source = prompt_source
+        self.mix_class_prompt = mix_class_prompt
+        self.num_cross_negatives = num_cross_negatives
         self.generic_negatives = list(
             generic_negatives if generic_negatives is not None
             else self.DEFAULT_GENERIC_NEGATIVES
@@ -162,31 +210,58 @@ class COCOSegmentDataset(Dataset):
                 self.img_to_anns[img_id] = []
             self.img_to_anns[img_id].append(ann)
 
-        # Load categories
-        self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
+        # Load categories. `categories` stays id -> name for existing callers;
+        # `category_defs` keeps the full dicts so per-class descriptions survive.
+        self.category_defs = {cat['id']: cat for cat in self.coco_data['categories']}
+        self.categories = {cid: cat['name'] for cid, cat in self.category_defs.items()}
+
+        # Optional descriptions sidecar (never written by Roboflow exports).
+        (self.desc_by_annotation,
+         self.desc_by_image,
+         self.desc_by_category) = load_descriptions_sidecar(self.split_dir)
 
         # Categories that actually have annotations (skips e.g. Roboflow's
-        # unused background/supercategory entry). These are the in-domain
-        # hard negatives: every image gets a must-return-nothing query for
-        # each of these classes it does not contain.
+        # unused background/supercategory entry).
         used_cat_ids = {ann['category_id'] for ann in self.coco_data['annotations']}
         self.used_category_names = sorted(
             {self.categories[cid].lower() for cid in used_cat_ids if cid in self.categories}
         )
 
-        # Drop generic negatives that share a word with any dataset category
+        # Resolve the prompt text for every annotation once, up front: the
+        # corpus of resolved texts is what in-domain negatives are drawn from.
+        self.ann_prompts = {
+            ann.get('id', idx): self._resolve_prompt(ann)
+            for idx, ann in enumerate(self.coco_data['annotations'])
+        }
+        self.prompt_corpus = sorted({p.lower() for p in self.ann_prompts.values()})
+        if self.mix_class_prompt:
+            self.prompt_corpus = sorted(
+                set(self.prompt_corpus) | set(self.used_category_names)
+            )
+
+        # Drop generic negatives that share a word with any positive prompt
         # (e.g. 'water' vs 'water ingress'): training them to return nothing
         # contradicts the related positive class and erodes discrimination.
-        category_words = {w for name in self.used_category_names for w in name.split()}
-        self.generic_negatives = [
-            n for n in self.generic_negatives
-            if not set(n.lower().split()) & category_words
-        ]
+        self.generic_negatives = filter_generic_negatives(
+            self.generic_negatives, self.prompt_corpus
+        )
+
+        self.uses_descriptions = (
+            self.prompt_corpus != self.used_category_names
+        )
 
         print(f"Loaded COCO dataset: {split} split")
         print(f"  Images: {len(self.image_ids)}")
         print(f"  Annotations: {len(self.coco_data['annotations'])}")
         print(f"  Categories: {self.categories}")
+        print(f"  Prompt source: {self.prompt_source}"
+              f"{' (descriptions found)' if self.uses_descriptions else ' (class names)'}")
+        print(f"  Distinct prompts: {len(self.prompt_corpus)}")
+        if self.mix_class_prompt:
+            print("  Also training the plain class-name prompt per image")
+        if len(self.prompt_corpus) > MAX_ALWAYS_NEGATIVES:
+            print(f"  Prompt corpus > {MAX_ALWAYS_NEGATIVES}: sampling "
+                  f"{self.num_cross_negatives} cross-prompt negatives per image")
 
         self.resolution = 1008
         self.transform = v2.Compose([
@@ -194,6 +269,45 @@ class COCOSegmentDataset(Dataset):
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
+
+    def _resolve_prompt(self, ann):
+        """
+        Text prompt for one annotation, per the resolution order in the class
+        docstring. Sidecar entries take priority over inline JSON fields at the
+        same level, so descriptions can be maintained outside the export.
+        """
+        category_id = ann.get("category_id", 0)
+        class_name = self.categories.get(category_id, "object")
+        category_def = self.category_defs.get(category_id, {})
+        image_id = ann.get("image_id")
+        img_info = self.images.get(image_id, {})
+        file_name = img_info.get("file_name", "")
+
+        annotation_text = (
+            self.desc_by_annotation.get(str(ann.get("id")))
+            or first_text(ann, ANNOTATION_TEXT_KEYS)
+        )
+        # Per-image sidecar entries may be keyed by file name or by image id.
+        image_text = (
+            self.desc_by_image.get(file_name)
+            or self.desc_by_image.get(str(image_id))
+            or first_text(img_info, IMAGE_TEXT_KEYS)
+        )
+        category_text = (
+            self.desc_by_category.get(class_name.lower())
+            or first_text(category_def, CATEGORY_TEXT_KEYS)
+        )
+
+        if self.prompt_source == "category_name":
+            return class_name
+        if self.prompt_source == "caption":
+            return annotation_text or class_name
+        if self.prompt_source == "image_caption":
+            return image_text or class_name
+        if self.prompt_source == "category_description":
+            return category_text or class_name
+        # auto
+        return annotation_text or image_text or category_text or class_name
 
     def __len__(self):
         return len(self.image_ids)
@@ -217,7 +331,10 @@ class COCOSegmentDataset(Dataset):
         annotations = self.img_to_anns.get(img_id, [])
 
         objects = []
+        # Parallel to `objects`, appended together so a skipped annotation can
+        # never shift the text off the object it belongs to.
         object_class_names = []
+        object_prompts = []
 
         # Scale factors
         scale_w = self.resolution / orig_w
@@ -229,10 +346,10 @@ class COCOSegmentDataset(Dataset):
             if bbox_coco is None:
                 continue
 
-            # Get class name from category_id
+            # Class name and resolved text prompt for this annotation
             category_id = ann.get("category_id", 0)
             class_name = self.categories.get(category_id, "object")
-            object_class_names.append(class_name)
+            prompt_text = self.ann_prompts.get(ann.get("id", i)) or class_name
 
             # Convert from COCO [x, y, w, h] to normalized [cx, cy, w, h] (CxCyWH)
             # SAM3 internally expects boxes in CxCyWH format normalized to [0, 1]
@@ -285,10 +402,12 @@ class COCOSegmentDataset(Dataset):
             obj = Object(
                 bbox=box_tensor,
                 area=(box_tensor[2] * box_tensor[3]).item(),
-                object_id=i,
+                object_id=len(objects),
                 segment=segment
             )
             objects.append(obj)
+            object_class_names.append(class_name)
+            object_prompts.append(prompt_text)
 
         image_obj = Image(
             data=image_tensor,
@@ -296,95 +415,100 @@ class COCOSegmentDataset(Dataset):
             size=(self.resolution, self.resolution)
         )
 
-        # Construct Queries - one per unique category
-        # Each query maps to only the objects of that category
+        # Construct Queries - one per unique prompt text (a class name, or a
+        # description when the dataset supplies one). Each query maps to only
+        # the objects that prompt refers to.
         from collections import defaultdict
 
-        # Group object IDs by their class name
+        # Group object IDs by their resolved prompt text
         class_to_object_ids = defaultdict(list)
-        for obj, class_name in zip(objects, object_class_names):
-            class_to_object_ids[class_name.lower()].append(obj.object_id)
+        for obj, prompt_text, class_name in zip(objects, object_prompts,
+                                                object_class_names):
+            class_to_object_ids[prompt_text.lower()].append(obj.object_id)
+            # Optionally train the bare class name as a second prompt, so a
+            # description-trained model still answers to 'crack'.
+            if self.mix_class_prompt and class_name.lower() != prompt_text.lower():
+                class_to_object_ids[class_name.lower()].append(obj.object_id)
 
-        # Create one query per category
-        queries = []
+        # Create one query per prompt
         if len(class_to_object_ids) > 0:
-            for query_text, obj_ids in class_to_object_ids.items():
-                query = FindQueryLoaded(
-                    query_text=query_text,
-                    image_id=0,
-                    object_ids_output=obj_ids,
-                    is_exhaustive=True,
-                    query_processing_order=0,
-                    inference_metadata=InferenceMetadata(
-                        coco_image_id=img_id,
-                        original_image_id=img_id,
-                        original_category_id=0,
-                        original_size=(orig_h, orig_w),
-                        object_id=-1,
-                        frame_index=-1
-                    )
-                )
-                queries.append(query)
+            queries = [
+                make_query(query_text, obj_ids, img_id, orig_h, orig_w)
+                for query_text, obj_ids in class_to_object_ids.items()
+            ]
         else:
             # No annotations: create a single generic query
-            query = FindQueryLoaded(
-                query_text="object",
-                image_id=0,
-                object_ids_output=[],
-                is_exhaustive=True,
-                query_processing_order=0,
-                inference_metadata=InferenceMetadata(
-                    coco_image_id=img_id,
-                    original_image_id=img_id,
-                    original_category_id=0,
-                    original_size=(orig_h, orig_w),
-                    object_id=-1,
-                    frame_index=-1
-                )
-            )
-            queries.append(query)
+            queries = [make_query("object", [], img_id, orig_h, orig_w)]
 
         # --- Hard-negative text queries ---------------------------------
         # Prompts that should return NOTHING for this image. Two tiers:
-        #   1. In-domain: every dataset category absent from this image is
-        #      ALWAYS included. These are the confusable prompts (e.g. 'crack'
-        #      on a water-ingress streak); sampling them randomly makes the
-        #      signal too rare for the model to keep the classes apart.
+        #   1. In-domain: prompts from this dataset that the image does not
+        #      contain. With class names the corpus is tiny, so every absent
+        #      one is ALWAYS used - these are the confusable prompts (e.g.
+        #      'crack' on a water-ingress streak) and sampling them makes the
+        #      signal too rare. With per-segment descriptions the corpus is as
+        #      large as the dataset, so num_cross_negatives are sampled instead.
         #   2. Generic out-of-domain concepts: num_negatives sampled per image.
         present_names = {name.lower() for name in class_to_object_ids.keys()}
-
-        def negative_query(neg_name):
-            return FindQueryLoaded(
-                query_text=neg_name,
-                image_id=0,
-                object_ids_output=[],
-                is_exhaustive=True,
-                query_processing_order=0,
-                inference_metadata=InferenceMetadata(
-                    coco_image_id=img_id,
-                    original_image_id=img_id,
-                    original_category_id=-1,
-                    original_size=(orig_h, orig_w),
-                    object_id=-1,
-                    frame_index=-1
-                )
-            )
-
-        for neg_name in self.used_category_names:
-            if neg_name not in present_names:
-                queries.append(negative_query(neg_name))
-
-        generic_pool = sorted({n.lower() for n in self.generic_negatives} - present_names)
-        if self.num_negatives > 0 and len(generic_pool) > 0:
-            num_neg = min(self.num_negatives, len(generic_pool))
-            for neg_name in random.sample(generic_pool, num_neg):
-                queries.append(negative_query(neg_name))
+        queries.extend(build_negative_queries(
+            present_texts=present_names,
+            prompt_corpus=self.prompt_corpus,
+            generic_negatives=self.generic_negatives,
+            num_negatives=self.num_negatives,
+            num_cross_negatives=self.num_cross_negatives,
+            img_id=img_id, orig_h=orig_h, orig_w=orig_w,
+        ))
 
         return Datapoint(
             find_queries=queries,
             images=[image_obj],
             raw_images=[pil_image]
         )
+
+
+def build_dataset(config, data_dir, split):
+    """
+    Build the train/valid dataset for the configured data format.
+
+    training.data_format:
+      "coco" (default) - `<data_dir>/<split>/_annotations.coco.json`, prompts
+          resolved from annotation/image/category descriptions with the class
+          name as fallback. See COCOSegmentDataset.
+      "odvg"           - `<data_dir>/<split>/_annotations.odvg.jsonl`,
+          Grounding-DINO ODVG with a phrase per region. See ODVGDataset.
+    """
+    training = config["training"]
+    data_format = str(training.get("data_format", "coco")).lower()
+    num_negatives = training.get("num_negatives", 2)
+    generic_negatives = training.get("generic_negatives", None)
+    num_cross_negatives = training.get("num_cross_negatives", 2)
+
+    if data_format == "coco":
+        return COCOSegmentDataset(
+            data_dir=data_dir,
+            split=split,
+            num_negatives=num_negatives,
+            generic_negatives=generic_negatives,
+            prompt_source=training.get("prompt_source", "auto"),
+            mix_class_prompt=training.get("mix_class_prompt", False),
+            num_cross_negatives=num_cross_negatives,
+        )
+
+    if data_format == "odvg":
+        return ODVGDataset(
+            data_dir=data_dir,
+            split=split,
+            num_negatives=num_negatives,
+            generic_negatives=generic_negatives,
+            num_cross_negatives=num_cross_negatives,
+            use_full_caption=training.get("use_full_caption", True),
+            annotations_file=training.get("odvg_annotations_file",
+                                          "_annotations.odvg.jsonl"),
+        )
+
+    raise ValueError(
+        f"Unknown training.data_format {data_format!r}; expected 'coco' or 'odvg'"
+    )
 
 
 def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
@@ -971,15 +1095,15 @@ class SAM3TrainerNative:
         # images (e.g. 'road' for pavement-crack datasets). None keeps the
         # built-in DEFAULT_GENERIC_NEGATIVES.
         generic_negatives = self.config["training"].get("generic_negatives", None)
+        data_format = str(self.config["training"].get("data_format", "coco")).lower()
 
-        # Load datasets using COCO format
+        # Load datasets in the configured format ("coco" or "odvg")
         print_rank0(f"\nLoading training data from {data_dir}...")
+        print_rank0(f"Data format: {data_format}")
         print_rank0(f"Hard negatives per image: {num_negatives}")
         if generic_negatives is not None:
             print_rank0(f"Custom generic negative pool: {generic_negatives}")
-        train_ds = COCOSegmentDataset(data_dir=data_dir, split="train",
-                                      num_negatives=num_negatives,
-                                      generic_negatives=generic_negatives)
+        train_ds = build_dataset(self.config, data_dir, "train")
 
         # Check if validation data exists
         has_validation = False
@@ -987,9 +1111,7 @@ class SAM3TrainerNative:
 
         try:
             print_rank0(f"\nLoading validation data from {data_dir}...")
-            val_ds = COCOSegmentDataset(data_dir=data_dir, split="valid",
-                                        num_negatives=num_negatives,
-                                        generic_negatives=generic_negatives)
+            val_ds = build_dataset(self.config, data_dir, "valid")
             if len(val_ds) > 0:
                 has_validation = True
                 print_rank0(f"Found validation data: {len(val_ds)} images")
